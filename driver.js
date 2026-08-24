@@ -195,19 +195,29 @@ router.post('/ride/driver-cancel', C.auth, async (req, res) => {
 
 /* ── admin ── */
 
-/* One-time bootstrap so granting admin never needs a terminal. */
+/* One-time bootstrap so granting admin never needs a terminal.
+   Accepts either ?phone=+9198... (looked up by phone) or ?uid=... (looked up
+   directly — copy the UID from Firebase Console > Authentication > Users if
+   the phone lookup ever mismatches, which is more reliable than a phone
+   number string that has to match exactly). */
 router.get('/admin/bootstrap', async (req, res) => {
   const want = process.env.RIDEX_BOOTSTRAP;
   if (!want) return res.status(410).json({ error: 'Bootstrap is closed.' });
   if (req.query.secret !== want) return res.status(403).json({ error: 'Wrong secret.' });
-  if (!req.query.phone) return res.status(400).json({ error: 'Add ?phone=+9198...' });
   try {
-    const u = await admin.auth().getUserByPhoneNumber(req.query.phone);
+    let u;
+    if (req.query.uid) {
+      u = await admin.auth().getUser(req.query.uid);
+    } else if (req.query.phone) {
+      u = await admin.auth().getUserByPhoneNumber(req.query.phone);
+    } else {
+      return res.status(400).json({ error: 'Add ?phone=+9198... or ?uid=...' });
+    }
     await admin.auth().setCustomUserClaims(u.uid, { admin: true });
-    res.json({ ok: true, uid: u.uid,
+    res.json({ ok: true, uid: u.uid, phone: u.phoneNumber || null,
       note: 'Sign out and back in, then delete RIDEX_BOOTSTRAP.' });
-  } catch {
-    res.status(404).json({ error: 'No account with that number. Sign in to the app first.' });
+  } catch (e) {
+    res.status(404).json({ error: 'No matching account (' + e.code + '). Check the value, or sign in to the app first.' });
   }
 });
 
