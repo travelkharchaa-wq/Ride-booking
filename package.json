@@ -1,0 +1,12 @@
+{
+  "name": "ridex-api",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node ridex-server.js" },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.4.0",
+    "ngeohash": "^0.6.3"
+  }
+}
