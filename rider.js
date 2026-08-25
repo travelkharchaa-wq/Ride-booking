@@ -55,8 +55,19 @@ router.post('/ride/create', C.auth, async (req, res) => {
   if (fare.uid !== req.user.uid)
     return res.status(403).json({ error: 'That fare belongs to another account.' });
 
-  if ((await db.ref('riderActive/' + req.user.uid).once('value')).val())
-    return res.status(409).json({ error: 'You already have a ride in progress.' });
+  /* Self-healing: a stale 'riderActive' pointer (from a ride that ended in a
+     dead-end state, or was abandoned) must not lock someone out of booking
+     forever. Only a genuinely live ride blocks a new one. */
+  const openId = (await db.ref('riderActive/' + req.user.uid).once('value')).val();
+  if (openId) {
+    const open = (await db.ref('rides/' + openId).once('value')).val();
+    const LIVE = ['searching', 'assigned', 'arrived', 'ontrip'];
+    const stale = !open
+      || !LIVE.includes(open.state)
+      || (Date.now() - (open.createdAt || 0) > 2 * 60 * 60 * 1000);
+    if (stale) await db.ref('riderActive/' + req.user.uid).remove();
+    else return res.status(409).json({ error: 'You already have a ride in progress.' });
+  }
 
   const rider = (await db.ref('riders/' + req.user.uid).once('value')).val() || {};
   const rideId = db.ref('rides').push().key;
@@ -138,6 +149,45 @@ router.post('/ride/share', C.auth, async (req, res) => {
     rideId: req.body.rideId, exp: Date.now() + 6 * 3600 * 1000
   });
   res.json({ url: (process.env.RIDEX_WEB || '') + '/t/?k=' + token });
+});
+
+/* Account screen: profile plus recent trips. */
+router.get('/rider/me', C.auth, async (req, res) => {
+  const uid = req.user.uid;
+  const [profSnap, idsSnap] = await Promise.all([
+    db.ref('riders/' + uid).once('value'),
+    db.ref('riderRides/' + uid).limitToLast(30).once('value')
+  ]);
+
+  const ids = [];
+  idsSnap.forEach(c => ids.push(c.key));
+
+  const rides = [];
+  await Promise.all(ids.map(async id => {
+    const r = (await db.ref('rides/' + id).once('value')).val();
+    if (!r) return;
+    rides.push({
+      id,
+      state: r.state,
+      at: r.createdAt || 0,
+      from: r.addr && r.addr[0] || '',
+      to: r.addr && r.addr[r.addr.length - 1] || '',
+      cls: r.cls,
+      fare: r.collected || (r.fare && r.fare.total) || 0,
+      driver: r.driver ? r.driver.name : null
+    });
+  }));
+
+  rides.sort((a, b) => b.at - a.at);
+  const prof = profSnap.val() || {};
+  const done = rides.filter(r => r.state === 'completed');
+  res.json({
+    name: prof.name || null,
+    phone: req.user.phone_number || null,
+    totalTrips: done.length,
+    totalSpent: done.reduce((s, r) => s + (r.fare || 0), 0),
+    rides: rides.slice(0, 20)
+  });
 });
 
 module.exports = router;
