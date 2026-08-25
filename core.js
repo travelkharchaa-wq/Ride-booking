@@ -59,8 +59,12 @@ function haversine(a, b) {
             Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng/2)**2;
   return 6371 * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
+/* Precision 4 (~20-40 km cells) so the 3x3 neighbour sweep comfortably
+   covers a 20 km radius search regardless of where the pickup falls inside
+   its own cell. Precision 5 (~5 km cells) was too fine for this — a pickup
+   near a cell edge could miss a driver 15 km away in the wrong direction. */
 const cellsAround = (lat, lng) => {
-  const c = geohash.encode(lat, lng, 5);
+  const c = geohash.encode(lat, lng, 4);
   return [c, ...geohash.neighbors(c)];
 };
 
@@ -103,7 +107,7 @@ async function candidates(pickup, cls) {
     if (prof.onlineSince && (now - prof.onlineSince) / 3600000 > FATIGUE_HOURS) return;
     if (prof.cls !== cls && !(cls === 'parcel' && prof.cls === 'bike')) return;
     const km = haversine(loc, pickup);
-    if (km > 7) return;
+    if (km > 20) return;   // driver search radius
     out.push({ uid, prof, km, score: km - ((prof.rating || 4.5) - 4) * 0.8 });
   }));
   return out.sort((a, b) => a.score - b.score);
@@ -126,9 +130,13 @@ async function advance(rideId) {
   }
 
   if (now - ride.createdAt > 4 * 60 * 1000) {
-    await db.ref('rides/' + rideId).update({
-      state: 'no_drivers',
-      message: 'No partners accepted your request. Please try again in a few minutes.'
+    /* Clear riderActive too. Without this the rider stays permanently blocked
+       from booking again — 'no_drivers' is a dead end, not an active ride. */
+    await db.ref().update({
+      ['rides/' + rideId + '/state']: 'no_drivers',
+      ['rides/' + rideId + '/message']:
+        'No partners accepted your request. Please try again in a few minutes.',
+      ['riderActive/' + ride.riderUid]: null
     });
     return (await db.ref('rides/' + rideId).once('value')).val();
   }
