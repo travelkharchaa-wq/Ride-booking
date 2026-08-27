@@ -37,6 +37,8 @@ router.post('/driver/beat', C.auth, async (req, res) => {
   const state = activeId ? 'busy' : (online ? 'idle' : 'offline');
 
   if (typeof lat === 'number' && typeof lng === 'number') {
+    // precision 4 — must match core.js's cellsAround(), or a driver's
+    // bucket key won't line up with what the matcher searches for
     const gh = geohash.encode(lat, lng, 4);
     const prev = (await db.ref('driverLoc/' + uid + '/gh').once('value')).val();
     const up = {};
@@ -62,8 +64,9 @@ router.post('/driver/beat', C.auth, async (req, res) => {
       ride = {
         id: activeId, state: r.state, pickup: r.addr[0],
         drop: r.addr[r.addr.length - 1], riderName: r.riderName,
-        riderPhone: r.riderPhone, fare: r.fare.total,
-        earn: Math.round(r.fare.total * (1 - COMMISSION)),
+        riderPhone: r.riderPhone,
+        fare: r.fare.total + (r.boost || 0),
+        earn: Math.round((r.fare.total + (r.boost || 0)) * (1 - COMMISSION)),
         waitCharge: r.waitCharge || 0, arrivedAt: r.arrivedAt || null
       };
     } else {
@@ -87,23 +90,40 @@ router.post('/offer/accept', C.auth, async (req, res) => {
   if (!prof || prof.status !== 'approved')
     return res.status(403).json({ error: 'Your account is not approved yet.' });
 
-  /* transaction: two drivers can never both win the same ride */
-  const r = await db.ref('rides/' + rideId + '/currentOffer').transaction(cur => {
-    if (!cur || cur.uid !== uid || cur.offerId !== offerId) return;
-    if (Date.now() > cur.expires) return;
-    return null;
-  });
-  if (!r.committed)
+  /* Validate the offer with a plain read first. */
+  const ride = (await db.ref('rides/' + rideId).once('value')).val();
+  if (!ride) return res.status(404).json({ error: 'That ride no longer exists.' });
+  if (ride.state !== 'searching')
+    return res.status(409).json({ error: 'That request went to another partner.' });
+
+  const cur = ride.currentOffer;
+  if (!cur || cur.uid !== uid || cur.offerId !== offerId)
+    return res.status(409).json({ error: 'That request went to another partner.' });
+  // small grace window so a tap at 1s left isn't lost to network latency
+  if (Date.now() > cur.expires + 8000)
+    return res.status(409).json({ error: 'That request expired.' });
+
+  /* Atomic claim on driverUid rather than on currentOffer.
+     A Firebase transaction can run its check once with null before server
+     data arrives; the previous version treated that null as "already taken"
+     and aborted, so accepting failed every time even with a single driver
+     online. Here null means "unclaimed", which is exactly the case we want
+     to succeed, while a non-null value still correctly blocks a second
+     driver from claiming the same ride. */
+  const claim = await db.ref('rides/' + rideId + '/driverUid')
+    .transaction(existing => (existing ? undefined : uid));
+
+  if (!claim.committed || claim.snapshot.val() !== uid)
     return res.status(409).json({ error: 'That request went to another partner.' });
 
   await db.ref().update({
     ['rides/' + rideId + '/state']: 'assigned',
-    ['rides/' + rideId + '/driverUid']: uid,
     ['rides/' + rideId + '/driver']: {
       name: prof.name, rating: prof.rating || 5, plate: prof.plate,
       model: prof.model, phone: prof.phone || null
     },
     ['rides/' + rideId + '/assignedAt']: Date.now(),
+    ['rides/' + rideId + '/currentOffer']: null,
     ['driverRides/' + uid + '/' + rideId]: true,
     ['driverActive/' + uid]: rideId,
     ['offers/' + uid + '/' + offerId]: null,
@@ -158,7 +178,8 @@ router.post('/ride/complete', C.auth, async (req, res) => {
   if (!ride || ride.driverUid !== req.user.uid)
     return res.status(403).json({ error: 'Not your ride.' });
 
-  const collected = ride.fare.total + (ride.waitCharge || 0);
+  // include any rider-added boost, or the driver would be short-changed
+  const collected = ride.fare.total + (ride.waitCharge || 0) + (ride.boost || 0);
   const commission = Math.round(collected * COMMISSION);
   const uid = req.user.uid;
 
