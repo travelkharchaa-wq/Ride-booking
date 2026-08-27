@@ -65,6 +65,10 @@ router.post('/driver/beat', C.auth, async (req, res) => {
         id: activeId, state: r.state, pickup: r.addr[0],
         drop: r.addr[r.addr.length - 1], riderName: r.riderName,
         riderPhone: r.riderPhone,
+        // coordinates so the driver app can hand off to a navigation app
+        pickupLat: r.points[0].lat, pickupLng: r.points[0].lng,
+        dropLat: r.points[r.points.length - 1].lat,
+        dropLng: r.points[r.points.length - 1].lng,
         fare: r.fare.total + (r.boost || 0),
         earn: Math.round((r.fare.total + (r.boost || 0)) * (1 - COMMISSION)),
         waitCharge: r.waitCharge || 0, arrivedAt: r.arrivedAt || null
