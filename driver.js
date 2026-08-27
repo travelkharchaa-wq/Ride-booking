@@ -37,7 +37,7 @@ router.post('/driver/beat', C.auth, async (req, res) => {
   const state = activeId ? 'busy' : (online ? 'idle' : 'offline');
 
   if (typeof lat === 'number' && typeof lng === 'number') {
-    const gh = geohash.encode(lat, lng, 5);
+    const gh = geohash.encode(lat, lng, 4);
     const prev = (await db.ref('driverLoc/' + uid + '/gh').once('value')).val();
     const up = {};
     up['driverLoc/' + uid] = { lat, lng, gh, state, ts: now };
