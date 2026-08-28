@@ -4,23 +4,59 @@ const C = require('./core');
 const router = express.Router();
 const { db, admin, geohash, CLASSES, WAIT, COMMISSION, FATIGUE_HOURS } = C;
 
+/* Documents are stored as compressed base64 in the Realtime Database rather
+   than Firebase Storage, which now requires a paid plan. This is fine for a
+   pilot with a handful of drivers; past a few hundred it should move to
+   object storage, since RTDB is not built to hold binary blobs. */
+const MAX_DOC = 700 * 1024;   // ~700 KB of base64 per document
+
+function checkDoc(d, label) {
+  if (!d || typeof d !== 'string' || !d.startsWith('data:'))
+    return label + ' is required.';
+  if (d.length > MAX_DOC)
+    return label + ' is too large. Please use a smaller photo.';
+  const mime = d.slice(5, d.indexOf(';'));
+  if (!['image/jpeg', 'image/png', 'image/webp', 'application/pdf'].includes(mime))
+    return label + ' must be a photo or a PDF.';
+  return null;
+}
+
 router.post('/driver/apply', C.auth, async (req, res) => {
   const uid = req.user.uid;
   if ((await db.ref('drivers/' + uid + '/status').once('value')).val() === 'approved')
     return res.json({ ok: true, status: 'approved' });
 
-  const { name, cls, plate, model, licence } = req.body;
-  await db.ref('drivers/' + uid).update({
-    name: String(name || '').slice(0, 60),
-    phone: req.user.phone_number || null,
-    cls: CLASSES[cls] ? cls : 'mini',
-    plate: String(plate || '').toUpperCase().slice(0, 15),
-    model: String(model || '').slice(0, 40),
-    licence: String(licence || '').slice(0, 25),
-    status: 'pending', rating: 5.0, trips: 0, dues: 0,
-    appliedAt: admin.database.ServerValue.TIMESTAMP
+  const { name, cls, plate, model, licence, licenceDoc, rcDoc } = req.body;
+
+  // both documents are mandatory — an unverified driver must never reach a rider
+  const e1 = checkDoc(licenceDoc, 'Driving licence');
+  if (e1) return res.status(400).json({ error: e1 });
+  const e2 = checkDoc(rcDoc, 'Vehicle RC');
+  if (e2) return res.status(400).json({ error: e2 });
+
+  await db.ref().update({
+    ['drivers/' + uid]: {
+      name: String(name || '').slice(0, 60),
+      phone: req.user.phone_number || null,
+      cls: CLASSES[cls] ? cls : 'mini',
+      plate: String(plate || '').toUpperCase().slice(0, 15),
+      model: String(model || '').slice(0, 40),
+      licence: String(licence || '').slice(0, 25),
+      status: 'pending', rating: 5.0, trips: 0, dues: 0,
+      hasDocs: true,
+      appliedAt: admin.database.ServerValue.TIMESTAMP
+    },
+    ['driverDocs/' + uid]: {
+      licenceDoc, rcDoc, at: admin.database.ServerValue.TIMESTAMP
+    }
   });
   res.json({ ok: true, status: 'pending' });
+});
+
+/* Support number is served only to signed-in users, so it never appears in
+   the public page source or gets scraped from the site. */
+router.get('/support', C.auth, async (req, res) => {
+  res.json({ phone: process.env.RIDEX_SUPPORT_PHONE || null });
 });
 
 /* Heartbeat. Stop calling it and the staleness check drops you from dispatch. */
@@ -266,6 +302,15 @@ router.post('/admin/driver/status', C.auth, C.adminOnly, async (req, res) => {
   }
   await db.ref().update(up);
   res.json({ ok: true });
+});
+
+/* Lets an admin actually look at the licence and RC before approving. */
+router.get('/admin/driver/docs', C.auth, C.adminOnly, async (req, res) => {
+  const uid = req.query.uid;
+  if (!uid) return res.status(400).json({ error: 'Missing uid.' });
+  const d = (await db.ref('driverDocs/' + uid).once('value')).val();
+  if (!d) return res.status(404).json({ error: 'No documents on file for this driver.' });
+  res.json(d);
 });
 
 router.post('/admin/driver/settle', C.auth, C.adminOnly, async (req, res) => {
