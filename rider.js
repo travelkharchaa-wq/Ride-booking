@@ -4,12 +4,43 @@ const C = require('./core');
 const router = express.Router();
 const { db, admin, crypto, CLASSES, CANCEL, LOCK_SEC } = C;
 
+const TERMS_VERSION = '1.0';
+
+function cleanStr(v, max){ return String(v == null ? '' : v).trim().slice(0, max); }
+
 router.post('/rider/profile', C.auth, async (req, res) => {
-  await db.ref('riders/' + req.user.uid).update({
-    name: String(req.body.name || '').slice(0, 60),
+  const uid = req.user.uid;
+  const existing = (await db.ref('riders/' + uid).once('value')).val() || {};
+
+  /* Terms are required on first save only — editing your name later should
+     not ask you to accept them again. Acceptance is recorded with the version
+     and a server timestamp, since a client-side checkbox proves nothing. */
+  if (!existing.termsAcceptedAt && req.body.acceptedTerms !== true)
+    return res.status(400).json({ error: 'Please accept the terms to continue.' });
+
+  const name = cleanStr(req.body.name, 60);
+  if (name.length < 2) return res.status(400).json({ error: 'Please enter your name.' });
+
+  const gender = ['male', 'female', 'other', 'prefer_not_to_say', ''].includes(req.body.gender)
+    ? req.body.gender : '';
+
+  const up = {
+    name,
     phone: req.user.phone_number || null,
+    email: cleanStr(req.body.email, 120),
+    gender,
+    dob: cleanStr(req.body.dob, 10),                    // YYYY-MM-DD
+    emergencyName: cleanStr(req.body.emergencyName, 60),
+    emergencyPhone: cleanStr(req.body.emergencyPhone, 20),
     updatedAt: admin.database.ServerValue.TIMESTAMP
-  });
+  };
+  if (!existing.createdAt) up.createdAt = admin.database.ServerValue.TIMESTAMP;
+  if (!existing.termsAcceptedAt) {
+    up.termsVersion = TERMS_VERSION;
+    up.termsAcceptedAt = admin.database.ServerValue.TIMESTAMP;
+  }
+
+  await db.ref('riders/' + uid).update(up);
   res.json({ ok: true });
 });
 
@@ -104,6 +135,7 @@ router.get('/ride/:id/status', C.auth, async (req, res) => {
   res.json({
     state: ride.state, message: ride.message || null,
     otp: ride.otp, fare: ride.fare, waitCharge: ride.waitCharge || 0,
+    boost: ride.boost || 0,
     driver: ride.driver || null, driverLoc
   });
 });
@@ -184,10 +216,67 @@ router.get('/rider/me', C.auth, async (req, res) => {
   res.json({
     name: prof.name || null,
     phone: req.user.phone_number || null,
+    email: prof.email || '',
+    gender: prof.gender || '',
+    dob: prof.dob || '',
+    emergencyName: prof.emergencyName || '',
+    emergencyPhone: prof.emergencyPhone || '',
+    memberSince: prof.createdAt || null,
     totalTrips: done.length,
     totalSpent: done.reduce((s, r) => s + (r.fare || 0), 0),
     rides: rides.slice(0, 20)
   });
+});
+
+/* How many drivers of a given class are free near a pickup point, and roughly
+   where. Coordinates are rounded to ~100 m — riders need to see that supply
+   exists, not to track individual drivers before a trip has been booked. */
+router.get('/nearby', C.auth, async (req, res) => {
+  const lat = Number(req.query.lat), lng = Number(req.query.lng);
+  const cls = req.query.cls;
+  if (!isFinite(lat) || !isFinite(lng) || !CLASSES[cls])
+    return res.status(400).json({ error: 'Bad request.' });
+
+  const pool = await C.candidates({ lat, lng }, cls);
+  res.json({
+    count: pool.length,
+    drivers: pool.slice(0, 12).map(d => ({
+      lat: Math.round(d.loc.lat * 1000) / 1000,
+      lng: Math.round(d.loc.lng * 1000) / 1000
+    }))
+  });
+});
+
+/* Voluntary fare increase while searching. Only ever upward, capped, and only
+   while no driver has accepted — so it can't be used to alter an agreed fare. */
+router.post('/ride/boost', C.auth, async (req, res) => {
+  const { rideId, extra } = req.body;
+  const add = Math.round(Number(extra));
+  if (!Number.isFinite(add) || add <= 0)
+    return res.status(400).json({ error: 'Enter a valid amount.' });
+
+  const ride = (await db.ref('rides/' + rideId).once('value')).val();
+  if (!ride || ride.riderUid !== req.user.uid)
+    return res.status(403).json({ error: 'Not your ride.' });
+  if (ride.state !== 'searching')
+    return res.status(409).json({ error: 'This ride is no longer searching.' });
+
+  const current = ride.boost || 0;
+  const next = current + add;
+  const cap = Math.max(150, Math.round(ride.fare.total));   // never more than double-ish
+  if (next > cap)
+    return res.status(400).json({ error: 'You have reached the maximum extra amount.' });
+
+  const up = { ['rides/' + rideId + '/boost']: next };
+  // retire the standing offer so the next driver immediately sees the new amount
+  if (ride.currentOffer) {
+    up['offers/' + ride.currentOffer.uid + '/' + ride.currentOffer.offerId] = null;
+    up['rides/' + rideId + '/currentOffer'] = null;
+  }
+  await db.ref().update(up);
+  await C.advance(rideId);
+
+  res.json({ ok: true, boost: next, payable: ride.fare.total + next });
 });
 
 module.exports = router;
