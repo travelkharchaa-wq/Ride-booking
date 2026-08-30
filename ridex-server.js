@@ -4,7 +4,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors({ origin: (process.env.RIDEX_ORIGINS || '*').split(',') }));
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '4mb' }));
 
 app.get('/health', (_, res) => res.json({ ok: true, at: Date.now() }));
 
