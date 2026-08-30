@@ -222,6 +222,8 @@ router.get('/rider/me', C.auth, async (req, res) => {
     emergencyName: prof.emergencyName || '',
     emergencyPhone: prof.emergencyPhone || '',
     memberSince: prof.createdAt || null,
+    termsAccepted: !!prof.termsAcceptedAt,
+    termsVersion: prof.termsVersion || null,
     totalTrips: done.length,
     totalSpent: done.reduce((s, r) => s + (r.fare || 0), 0),
     rides: rides.slice(0, 20)
