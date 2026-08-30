@@ -26,7 +26,12 @@ router.post('/driver/apply', C.auth, async (req, res) => {
   if ((await db.ref('drivers/' + uid + '/status').once('value')).val() === 'approved')
     return res.json({ ok: true, status: 'approved' });
 
-  const { name, cls, plate, model, licence, licenceDoc, rcDoc } = req.body;
+  const { name, cls, plate, model, licence, licenceDoc, rcDoc, acceptedTerms } = req.body;
+
+  /* Drivers must accept explicitly too — their obligations under the terms
+     (valid licence, RC, insurance, permits) are the substantive ones. */
+  if (acceptedTerms !== true)
+    return res.status(400).json({ error: 'Please accept the terms to continue.' });
 
   // both documents are mandatory — an unverified driver must never reach a rider
   const e1 = checkDoc(licenceDoc, 'Driving licence');
@@ -44,6 +49,8 @@ router.post('/driver/apply', C.auth, async (req, res) => {
       licence: String(licence || '').slice(0, 25),
       status: 'pending', rating: 5.0, trips: 0, dues: 0,
       hasDocs: true,
+      termsVersion: '1.0',
+      termsAcceptedAt: admin.database.ServerValue.TIMESTAMP,
       appliedAt: admin.database.ServerValue.TIMESTAMP
     },
     ['driverDocs/' + uid]: {
@@ -105,9 +112,8 @@ router.post('/driver/beat', C.auth, async (req, res) => {
         pickupLat: r.points[0].lat, pickupLng: r.points[0].lng,
         dropLat: r.points[r.points.length - 1].lat,
         dropLng: r.points[r.points.length - 1].lng,
-        fare: r.fare.total + (r.boost || 0),
         earn: Math.round((r.fare.total + (r.boost || 0)) * (1 - COMMISSION)),
-        waitCharge: r.waitCharge || 0, arrivedAt: r.arrivedAt || null
+        arrivedAt: r.arrivedAt || null
       };
     } else {
       await db.ref('driverActive/' + uid).remove();
@@ -280,6 +286,42 @@ router.get('/admin/bootstrap', async (req, res) => {
   } catch (e) {
     res.status(404).json({ error: 'No matching account (' + e.code + '). Check the value, or sign in to the app first.' });
   }
+});
+
+/* Drivers can no longer cancel from their own app — they call RideX instead,
+   so a human decides whether the customer gets reassigned or the trip is
+   called off. This is that lever. */
+router.post('/admin/ride/cancel', C.auth, C.adminOnly, async (req, res) => {
+  const { rideId, action, reason } = req.body;
+  const ride = (await db.ref('rides/' + rideId).once('value')).val();
+  if (!ride) return res.status(404).json({ error: 'Ride not found.' });
+
+  const uid = ride.driverUid;
+  const up = {
+    ['rides/' + rideId + '/adminNote']: String(reason || '').slice(0, 200),
+    ['rides/' + rideId + '/handledBy']: req.user.uid,
+    ['rides/' + rideId + '/currentOffer']: null
+  };
+  if (uid) {
+    up['driverLoc/' + uid + '/state'] = 'idle';
+    up['driverActive/' + uid] = null;
+    up['drivers/' + uid + '/cancelCount'] = admin.database.ServerValue.increment(1);
+  }
+
+  if (action === 'reassign') {
+    // put it back into dispatch for another driver, fare unchanged
+    up['rides/' + rideId + '/state'] = 'searching';
+    up['rides/' + rideId + '/driverUid'] = null;
+    up['rides/' + rideId + '/driver'] = null;
+    await db.ref().update(up);
+    await C.advance(rideId);
+    return res.json({ ok: true, state: 'searching' });
+  }
+
+  up['rides/' + rideId + '/state'] = 'cancelled_driver';
+  up['riderActive/' + ride.riderUid] = null;
+  await db.ref().update(up);
+  res.json({ ok: true, state: 'cancelled_driver' });
 });
 
 router.get('/admin/drivers', C.auth, C.adminOnly, async (req, res) => {
