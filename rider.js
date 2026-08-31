@@ -192,7 +192,10 @@ router.get('/rider/me', C.auth, async (req, res) => {
   ]);
 
   const ids = [];
-  idsSnap.forEach(c => ids.push(c.key));
+  /* Block body: Array.push returns the new length, which Firebase treats as
+     a signal to stop enumerating — so this used to collect a single ride and
+     a customer's history showed only one trip however many they had taken. */
+  idsSnap.forEach(c => { ids.push(c.key); });
 
   const rides = [];
   await Promise.all(ids.map(async id => {
