@@ -71,6 +71,23 @@ router.post('/driver/token', C.auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* Tells you which account you are actually signed in as, and whether it has
+   admin. Useful when the console says "Not permitted" and you need the UID to
+   add to adminUids — no bootstrap secret or deploy required. */
+router.get('/whoami', C.auth, async (req, res) => {
+  let inList = false;
+  try {
+    inList = (await db.ref('adminUids/' + req.user.uid).once('value')).val() === true;
+  } catch (e) { /* reported as false */ }
+  res.json({
+    uid: req.user.uid,
+    phone: req.user.phone_number || null,
+    adminClaim: !!req.user.admin,
+    adminInList: inList,
+    isAdmin: !!req.user.admin || inList
+  });
+});
+
 /* Support number is served only to signed-in users, so it never appears in
    the public page source or gets scraped from the site. */
 router.get('/support', C.auth, async (req, res) => {
