@@ -4,6 +4,23 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors({ origin: (process.env.RIDEX_ORIGINS || '*').split(',') }));
+
+/* Every response is explicitly marked as never cacheable. Without this, a GET
+   endpoint (driver list, ride status, the live map) can be served stale by
+   any layer sitting between the browser and this server — a mobile carrier's
+   transparent proxy, a CDN edge, or even the browser's own HTTP cache — since
+   none of those need permission to cache a response that doesn't forbid it.
+   The symptom is exactly what showed up here: new data existed in Firebase,
+   but every poll, including a raw fetch() run directly in devtools, kept
+   returning an old snapshot because they were all hitting the same cached
+   copy rather than this server. */
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
 /* Driver licence and RC photos are sent as base64, roughly 650 KB each, so
    the default small-body limit would reject every application before the
    route even runs. Everything else on this API is tiny. */
