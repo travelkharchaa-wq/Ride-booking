@@ -89,7 +89,10 @@ async function candidates(pickup, cls) {
   const ids = new Set();
   await Promise.all(cellsAround(pickup.lat, pickup.lng).map(async c => {
     const s = await db.ref('geo/' + c).once('value');
-    s.forEach(ch => ids.add(ch.key));
+    /* Block body, not an expression body. Firebase cancels enumeration when
+       the callback returns a truthy value, and Set.add returns the Set — so
+       an arrow returning it directly would read only the first child. */
+    s.forEach(ch => { ids.add(ch.key); });
   }));
 
   const now = Date.now();
