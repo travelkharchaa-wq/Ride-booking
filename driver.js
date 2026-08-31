@@ -60,6 +60,17 @@ router.post('/driver/apply', C.auth, async (req, res) => {
   res.json({ ok: true, status: 'pending' });
 });
 
+/* Push token, so the driver can be reached when the app is closed. */
+router.post('/driver/token', C.auth, async (req, res) => {
+  const token = String(req.body.token || '').slice(0, 400);
+  if (!token) return res.status(400).json({ error: 'Missing token.' });
+  await db.ref('drivers/' + req.user.uid).update({
+    fcmToken: token,
+    fcmUpdatedAt: admin.database.ServerValue.TIMESTAMP
+  });
+  res.json({ ok: true });
+});
+
 /* Support number is served only to signed-in users, so it never appears in
    the public page source or gets scraped from the site. */
 router.get('/support', C.auth, async (req, res) => {
