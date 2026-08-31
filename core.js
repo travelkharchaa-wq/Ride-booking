@@ -198,9 +198,24 @@ async function auth(req, res, next) {
     next();
   } catch { res.status(401).json({ error: 'Please sign in again.' }); }
 }
-function adminOnly(req, res, next) {
-  if (!req.user.admin) return res.status(403).json({ error: 'Not permitted.' });
-  next();
+
+/* Admin access is granted two ways:
+     1. a custom auth claim (set by the bootstrap endpoint), or
+     2. an entry under adminUids/{uid} in the database.
+
+   The second exists because the first needs an environment variable, a deploy
+   and a secret URL to line up — and when any of that goes wrong you are
+   locked out of your own console with no way back in. A row in the database
+   can be added by hand in the Firebase Console in ten seconds. */
+async function adminOnly(req, res, next) {
+  try {
+    if (req.user.admin) return next();
+    const ok = (await db.ref('adminUids/' + req.user.uid).once('value')).val();
+    if (ok === true) return next();
+  } catch (e) {
+    console.error('admin check failed:', e);
+  }
+  res.status(403).json({ error: 'Not permitted.' });
 }
 
 module.exports = {
