@@ -108,7 +108,7 @@ async function candidates(pickup, cls) {
     if (prof.cls !== cls && !(cls === 'parcel' && prof.cls === 'bike')) return;
     const km = haversine(loc, pickup);
     if (km > 20) return;   // driver search radius
-    out.push({ uid, prof, km, score: km - ((prof.rating || 4.5) - 4) * 0.8 });
+    out.push({ uid, prof, loc, km, score: km - ((prof.rating || 4.5) - 4) * 0.8 });
   }));
   return out.sort((a, b) => a.score - b.score);
 }
@@ -152,13 +152,17 @@ async function advance(rideId) {
 
   const offerId = db.ref('offers').push().key;
   const expires = now + OFFER_SEC * 1000;
+  /* A rider can voluntarily add to the fare while searching to improve their
+     chances. It is added on top of the locked fare, never subtracted, and the
+     driver sees the boosted amount in the offer. */
+  const payable = ride.fare.total + (ride.boost || 0);
   await db.ref().update({
     ['offers/' + next.uid + '/' + offerId]: {
       rideId, expires,
       pickup: ride.addr[0], drop: ride.addr[ride.addr.length - 1],
       km: ride.fare.km, pickupKm: +next.km.toFixed(1),
-      earn: Math.round(ride.fare.total * (1 - COMMISSION)),
-      collect: ride.fare.total, paymentMode: 'cash'
+      earn: Math.round(payable * (1 - COMMISSION)),
+      boost: ride.boost || 0, paymentMode: 'cash'
     },
     ['rides/' + rideId + '/tried/' + next.uid]: true,
     ['rides/' + rideId + '/currentOffer']: { uid: next.uid, offerId, expires }
