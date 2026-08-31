@@ -416,7 +416,17 @@ router.get('/admin/map', C.auth, C.adminOnly, async (req, res) => {
 router.get('/admin/drivers', C.auth, C.adminOnly, async (req, res) => {
   const s = await db.ref('drivers').once('value');
   const out = [];
-  s.forEach(c => out.push(Object.assign({ uid: c.key }, c.val())));
+  /* Block body is required. Firebase stops enumerating as soon as the
+     callback returns something truthy, and Array.push returns the new
+     length — so an expression-bodied arrow silently returned only the first
+     driver no matter how many existed. */
+  s.forEach(c => { out.push(Object.assign({ uid: c.key }, c.val())); });
+  /* Logged because this endpoint once returned a single record while the
+     database held eight, and nothing in the response itself revealed whether
+     the read or the serialisation was at fault. */
+  console.log('[admin/drivers] snapshot children=' + s.numChildren() +
+              ' collected=' + out.length +
+              ' keys=' + Object.keys(s.val() || {}).join(','));
   res.json(out.sort((a, b) => (b.appliedAt || 0) - (a.appliedAt || 0)));
 });
 
@@ -468,7 +478,7 @@ router.get('/admin/live', C.auth, C.adminOnly, async (req, res) => {
         from: r.addr && r.addr[0], to: r.addr && r.addr[r.addr.length - 1],
         fare: r.fare && r.fare.total });
   });
-  sos.forEach(c => alerts.push(Object.assign({ id: c.key }, c.val())));
+  sos.forEach(c => { alerts.push(Object.assign({ id: c.key }, c.val())); });
   res.json({ active, alerts });
 });
 
