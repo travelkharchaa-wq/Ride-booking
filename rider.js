@@ -240,13 +240,18 @@ router.get('/nearby', C.auth, async (req, res) => {
     return res.status(400).json({ error: 'Bad request.' });
 
   const pool = await C.candidates({ lat, lng }, cls);
-  res.json({
-    count: pool.length,
-    drivers: pool.slice(0, 12).map(d => ({
+  /* Defensive: only map entries that actually carry a location. A single
+     malformed record must not be able to throw here — this endpoint is polled
+     constantly, and an exception in it previously took the whole server down. */
+  const drivers = pool
+    .filter(d => d && d.loc && typeof d.loc.lat === 'number' && typeof d.loc.lng === 'number')
+    .slice(0, 12)
+    .map(d => ({
       lat: Math.round(d.loc.lat * 1000) / 1000,
       lng: Math.round(d.loc.lng * 1000) / 1000
-    }))
-  });
+    }));
+
+  res.json({ count: pool.length, drivers });
 });
 
 /* Voluntary fare increase while searching. Only ever upward, capped, and only
