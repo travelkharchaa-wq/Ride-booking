@@ -167,6 +167,27 @@ async function advance(rideId) {
     ['rides/' + rideId + '/tried/' + next.uid]: true,
     ['rides/' + rideId + '/currentOffer']: { uid: next.uid, offerId, expires }
   });
+
+  /* Wake the driver even if their app is closed. Sent as a data-only message
+     so the service worker builds the notification itself — and deliberately
+     not awaited, because a slow push must never hold up dispatch. */
+  if (next.prof.fcmToken) {
+    admin.messaging().send({
+      token: next.prof.fcmToken,
+      data: {
+        title: 'New ride request · \u20b9' + Math.round(payable * (1 - COMMISSION)),
+        body: ride.addr[0] + ' \u2192 ' + ride.addr[ride.addr.length - 1]
+      },
+      android: { priority: 'high' },
+      webpush: { headers: { Urgency: 'high', TTL: String(OFFER_SEC) } }
+    }).catch(err => {
+      console.warn('push to ' + next.uid + ' failed:', err.code || err.message);
+      // a token goes stale when the driver clears data or reinstalls
+      if (err.code === 'messaging/registration-token-not-registered')
+        db.ref('drivers/' + next.uid + '/fcmToken').remove().catch(() => {});
+    });
+  }
+
   return (await db.ref('rides/' + rideId).once('value')).val();
 }
 
