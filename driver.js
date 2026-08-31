@@ -2,7 +2,7 @@
 const express = require('express');
 const C = require('./core');
 const router = express.Router();
-const { db, admin, geohash, CLASSES, WAIT, COMMISSION, FATIGUE_HOURS } = C;
+const { db, admin, geohash, CLASSES, WAIT, COMMISSION, FATIGUE_HOURS, STALE_MS } = C;
 
 /* Documents are stored as compressed base64 in the Realtime Database rather
    than Firebase Storage, which now requires a paid plan. This is fine for a
@@ -333,6 +333,67 @@ router.post('/admin/ride/cancel', C.auth, C.adminOnly, async (req, res) => {
   up['riderActive/' + ride.riderUid] = null;
   await db.ref().update(up);
   res.json({ ok: true, state: 'cancelled_driver' });
+});
+
+/* Operations map: where every driver is, and where trips are happening.
+   Rider positions are only included for rides actually in progress — the app
+   does not track a customer's location when they are not on a trip, and it
+   should not start doing so just to populate a dashboard. */
+router.get('/admin/map', C.auth, C.adminOnly, async (req, res) => {
+  const now = Date.now();
+  const [locSnap, drvSnap, rideSnap] = await Promise.all([
+    db.ref('driverLoc').once('value'),
+    db.ref('drivers').once('value'),
+    db.ref('rides').orderByChild('createdAt').startAt(now - 6 * 3600 * 1000).once('value')
+  ]);
+
+  const profs = drvSnap.val() || {};
+  const drivers = [];
+  locSnap.forEach(c => {
+    const l = c.val() || {};
+    const p = profs[c.key] || {};
+    if (typeof l.lat !== 'number' || typeof l.lng !== 'number') return;
+    const stale = now - (l.ts || 0) > STALE_MS;
+    drivers.push({
+      uid: c.key,
+      name: p.name || 'Driver',
+      plate: p.plate || '',
+      cls: p.cls || 'mini',
+      status: p.status || 'pending',
+      // a driver whose heartbeat stopped is shown as offline, whatever the
+      // last written state said — otherwise the map lies about availability
+      state: stale ? 'offline' : (l.state || 'offline'),
+      lat: l.lat, lng: l.lng,
+      agoSec: Math.round((now - (l.ts || now)) / 1000)
+    });
+  });
+
+  const trips = [];
+  rideSnap.forEach(c => {
+    const r = c.val();
+    if (!['searching', 'assigned', 'arrived', 'ontrip'].includes(r.state)) return;
+    if (!r.points || !r.points[0]) return;
+    trips.push({
+      id: c.key, state: r.state,
+      rider: r.riderName || 'Rider',
+      driver: r.driver ? r.driver.name : null,
+      cls: r.cls,
+      fare: r.fare ? r.fare.total : 0,
+      from: r.addr && r.addr[0], to: r.addr && r.addr[r.addr.length - 1],
+      lat: r.points[0].lat, lng: r.points[0].lng,
+      dropLat: r.points[r.points.length - 1].lat,
+      dropLng: r.points[r.points.length - 1].lng
+    });
+  });
+
+  const counts = {
+    online:  drivers.filter(d => d.state === 'idle').length,
+    busy:    drivers.filter(d => d.state === 'busy').length,
+    offline: drivers.filter(d => d.state === 'offline').length,
+    approved: Object.values(profs).filter(p => p.status === 'approved').length,
+    trips: trips.length
+  };
+  res.json({ drivers, trips, counts, at: now });
 });
 
 router.get('/admin/drivers', C.auth, C.adminOnly, async (req, res) => {
