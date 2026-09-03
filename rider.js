@@ -112,7 +112,15 @@ router.post('/ride/create', C.auth, async (req, res) => {
       otp: 1000 + crypto.randomInt(9000),
       state: 'searching', createdAt: Date.now(), tried: {}
     },
-    ['riderRides/' + req.user.uid + '/' + rideId]: true,
+    /* Store a small summary alongside the reference, not just `true`. The
+       profile screen previously had to read every ride individually — thirty
+       separate round trips before anything could render. */
+    ['riderRides/' + req.user.uid + '/' + rideId]: {
+      at: Date.now(), cls,
+      from: addr && addr[0] || '',
+      to: addr && addr[addr.length - 1] || '',
+      fare: fare.total, state: 'searching', driver: null
+    },
     ['riderActive/' + req.user.uid]: rideId
   });
 
@@ -150,6 +158,7 @@ router.post('/ride/cancel', C.auth, async (req, res) => {
   const up = {
     ['rides/' + req.body.rideId + '/state']: 'cancelled_rider',
     ['rides/' + req.body.rideId + '/cancelFee']: fee,
+    ['riderRides/' + req.user.uid + '/' + req.body.rideId + '/state']: 'cancelled_rider',
     ['riderActive/' + req.user.uid]: null
   };
   if (ride.currentOffer)
@@ -191,27 +200,41 @@ router.get('/rider/me', C.auth, async (req, res) => {
     db.ref('riderRides/' + uid).limitToLast(30).once('value')
   ]);
 
-  const ids = [];
-  /* Block body: Array.push returns the new length, which Firebase treats as
-     a signal to stop enumerating — so this used to collect a single ride and
-     a customer's history showed only one trip however many they had taken. */
-  idsSnap.forEach(c => { ids.push(c.key); });
-
   const rides = [];
-  await Promise.all(ids.map(async id => {
-    const r = (await db.ref('rides/' + id).once('value')).val();
-    if (!r) return;
-    rides.push({
-      id,
-      state: r.state,
-      at: r.createdAt || 0,
-      from: r.addr && r.addr[0] || '',
-      to: r.addr && r.addr[r.addr.length - 1] || '',
-      cls: r.cls,
-      fare: r.collected || (r.fare && r.fare.total) || 0,
-      driver: r.driver ? r.driver.name : null
-    });
-  }));
+  const legacy = [];
+  /* Block body: Array.push returns the new length, which Firebase treats as
+     a signal to stop enumerating — this used to collect only one ride. */
+  idsSnap.forEach(c => {
+    const v = c.val();
+    if (v && typeof v === 'object') {
+      // summary written when the ride was booked — no extra read needed
+      rides.push({
+        id: c.key, state: v.state, at: v.at || 0,
+        from: v.from || '', to: v.to || '', cls: v.cls,
+        fare: v.fare || 0, driver: v.driver || null
+      });
+    } else {
+      // rides booked before summaries existed still need fetching
+      legacy.push(c.key);
+    }
+  });
+
+  if (legacy.length) {
+    await Promise.all(legacy.map(async id => {
+      const r = (await db.ref('rides/' + id).once('value')).val();
+      if (!r) return;
+      rides.push({
+        id,
+        state: r.state,
+        at: r.createdAt || 0,
+        from: r.addr && r.addr[0] || '',
+        to: r.addr && r.addr[r.addr.length - 1] || '',
+        cls: r.cls,
+        fare: r.collected || (r.fare && r.fare.total) || 0,
+        driver: r.driver ? r.driver.name : null
+      });
+    }));
+  }
 
   rides.sort((a, b) => b.at - a.at);
   const prof = profSnap.val() || {};
