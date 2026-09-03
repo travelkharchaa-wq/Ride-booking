@@ -198,6 +198,8 @@ router.post('/offer/accept', C.auth, async (req, res) => {
     },
     ['rides/' + rideId + '/assignedAt']: Date.now(),
     ['rides/' + rideId + '/currentOffer']: null,
+    ['riderRides/' + ride.riderUid + '/' + rideId + '/state']: 'assigned',
+    ['riderRides/' + ride.riderUid + '/' + rideId + '/driver']: prof.name || null,
     ['driverRides/' + uid + '/' + rideId]: true,
     ['driverActive/' + uid]: rideId,
     ['offers/' + uid + '/' + offerId]: null,
@@ -265,6 +267,8 @@ router.post('/ride/complete', C.auth, async (req, res) => {
     ['drivers/' + uid + '/dues']: admin.database.ServerValue.increment(commission),
     ['drivers/' + uid + '/trips']: admin.database.ServerValue.increment(1),
     ['ledger/' + uid + '/' + req.body.rideId]: { collected, commission, at: Date.now() },
+    ['riderRides/' + ride.riderUid + '/' + req.body.rideId + '/state']: 'completed',
+    ['riderRides/' + ride.riderUid + '/' + req.body.rideId + '/fare']: collected,
     ['driverLoc/' + uid + '/state']: 'idle',
     ['driverActive/' + uid]: null,
     ['riderActive/' + ride.riderUid]: null
@@ -347,6 +351,7 @@ router.post('/admin/ride/cancel', C.auth, C.adminOnly, async (req, res) => {
   }
 
   up['rides/' + rideId + '/state'] = 'cancelled_driver';
+  up['riderRides/' + ride.riderUid + '/' + rideId + '/state'] = 'cancelled_driver';
   up['riderActive/' + ride.riderUid] = null;
   await db.ref().update(up);
   res.json({ ok: true, state: 'cancelled_driver' });
@@ -421,12 +426,8 @@ router.get('/admin/drivers', C.auth, C.adminOnly, async (req, res) => {
      length — so an expression-bodied arrow silently returned only the first
      driver no matter how many existed. */
   s.forEach(c => { out.push(Object.assign({ uid: c.key }, c.val())); });
-  /* Logged because this endpoint once returned a single record while the
-     database held eight, and nothing in the response itself revealed whether
-     the read or the serialisation was at fault. */
   console.log('[admin/drivers] snapshot children=' + s.numChildren() +
-              ' collected=' + out.length +
-              ' keys=' + Object.keys(s.val() || {}).join(','));
+              ' collected=' + out.length);
   res.json(out.sort((a, b) => (b.appliedAt || 0) - (a.appliedAt || 0)));
 });
 
@@ -465,21 +466,4 @@ router.post('/admin/driver/settle', C.auth, C.adminOnly, async (req, res) => {
 });
 
 router.get('/admin/live', C.auth, C.adminOnly, async (req, res) => {
-  const [rides, sos] = await Promise.all([
-    db.ref('rides').orderByChild('createdAt').startAt(Date.now() - 6*3600*1000).once('value'),
-    db.ref('sos').orderByChild('at').startAt(Date.now() - 24*3600*1000).once('value')
-  ]);
-  const active = [], alerts = [];
-  rides.forEach(c => {
-    const r = c.val();
-    if (r.state !== 'completed' && !String(r.state).startsWith('cancelled'))
-      active.push({ id: c.key, state: r.state, rider: r.riderName,
-        driver: r.driver ? r.driver.name : null,
-        from: r.addr && r.addr[0], to: r.addr && r.addr[r.addr.length - 1],
-        fare: r.fare && r.fare.total });
-  });
-  sos.forEach(c => { alerts.push(Object.assign({ id: c.key }, c.val())); });
-  res.json({ active, alerts });
-});
-
-module.exports = router;
+  
