@@ -21,13 +21,20 @@ router.post('/rider/profile', C.auth, async (req, res) => {
   const name = cleanStr(req.body.name, 60);
   if (name.length < 2) return res.status(400).json({ error: 'Please enter your name.' });
 
+  const email = cleanStr(req.body.email, 120);
+  /* Required on first save only, and validated here as well as in the app —
+     a client-side check is a convenience, not a guarantee. Existing accounts
+     are not forced to supply one retrospectively. */
+  if (!existing.createdAt && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email))
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+
   const gender = ['male', 'female', 'other', 'prefer_not_to_say', ''].includes(req.body.gender)
     ? req.body.gender : '';
 
   const up = {
     name,
     phone: req.user.phone_number || null,
-    email: cleanStr(req.body.email, 120),
+    email,
     gender,
     dob: cleanStr(req.body.dob, 10),                    // YYYY-MM-DD
     emergencyName: cleanStr(req.body.emergencyName, 60),
