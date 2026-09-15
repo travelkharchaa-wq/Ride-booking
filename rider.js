@@ -1,6 +1,7 @@
 /* RideX rider routes */
 const express = require('express');
 const C = require('./core');
+const Pool = require('./pool');
 const router = express.Router();
 const { db, admin, crypto, CLASSES, CANCEL, LOCK_SEC } = C;
 
@@ -86,7 +87,7 @@ router.post('/quote/lock', C.auth, async (req, res) => {
 });
 
 router.post('/ride/create', C.auth, async (req, res) => {
-  const { points, addr, cls, lock } = req.body;
+  const { points, addr, cls, lock, shared } = req.body;
   let fare;
   try { fare = C.verifyLock(lock); }
   catch { return res.status(409).json({ error: 'That fare expired. Please get a fresh quote.' }); }
@@ -116,6 +117,10 @@ router.post('/ride/create', C.auth, async (req, res) => {
       riderName: rider.name || 'Rider',
       riderPhone: req.user.phone_number || null,
       cls, points, addr, fare, paymentMode: 'cash',
+      /* Pooling is opt-in per ride, and only for classes that have a spare seat.
+         Gender is copied onto the ride so matching never needs a second read. */
+      shared: shared === true && Pool.canPool(cls),
+      riderGender: rider.gender || '',
       otp: 1000 + crypto.randomInt(9000),
       state: 'searching', createdAt: Date.now(), tried: {}
     },
@@ -320,3 +325,4 @@ router.post('/ride/boost', C.auth, async (req, res) => {
 });
 
 module.exports = router;
+            
