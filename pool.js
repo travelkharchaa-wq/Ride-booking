@@ -34,6 +34,10 @@ const OFFER_TRIES = 2;          // how many times the same rider is asked
 function canPool(cls) { return POOL_CLASSES.includes(cls); }
 function classesCompatible(a, b) { return canPool(a) && a === b; }
 
+/* Riders are only paired with someone of the same stated gender. */
+const POOL_GENDERS = ['male', 'female', 'other'];
+function gendersCompatible(a, b) { return POOL_GENDERS.includes(a) && a === b; }
+
 const rad = d => d * Math.PI / 180;
 function haversine(a, b) {
   const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
@@ -161,6 +165,11 @@ function evaluateMatch(ongoing, waiting, routes) {
   if (ongoing.state !== 'ontrip') return no('trip not under way');
   if (ongoing.poolWith) return no('already carrying a second rider');
 
+  /* Same-gender pairing only. Fails closed: a blank or 'prefer not to say'
+     profile is never pooled, because we cannot confirm the match. */
+  if (!gendersCompatible(ongoing.riderGender, waiting.riderGender))
+    return no('gender mismatch');
+
   const near = pickupIsNearRoute(waiting.pickup, routes.line);
   if (!near.ok) return no('pickup ' + near.offRouteKm + ' km off route');
 
@@ -186,9 +195,11 @@ module.exports = {
   P2_SURCHARGE, SHARE_DISCOUNT,
   POOL_CLASSES, POOL_SEATS, OFFER_SEC, OFFER_TRIES,
   MIN_P1_SAVING, MIN_P2_SAVING,
-  canPool, classesCompatible,
+  POOL_GENDERS,
+  canPool, classesCompatible, gendersCompatible,
   haversine, distToSegment, projectOnRoute,
   pickupIsNearRoute, detourWithinLimits,
   splitFares, poolIsWorthwhile, dropOrder, evaluateMatch
 };
+
 
