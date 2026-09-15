@@ -21,8 +21,7 @@ const CLASSES = {
   bike:   { base:20, incl:1.5, perKm:7,  perMin:1.0, min:25,  fee:3,  gst:0,    factor:0.78 },
   auto:   { base:30, incl:1.5, perKm:12, perMin:1.2, min:35,  fee:5,  gst:0,    factor:1.12 },
   mini:   { base:50, incl:2.0, perKm:15, perMin:1.5, min:60,  fee:9,  gst:0.05, factor:1.00 },
-  prime:  { base:80, incl:2.0, perKm:20, perMin:2.0, min:100, fee:12, gst:0.05, factor:1.00 },
-  parcel: { base:25, incl:1.5, perKm:8,  perMin:1.0, min:30,  fee:5,  gst:0.18, factor:0.78 }
+  prime:  { base:80, incl:2.0, perKm:20, perMin:2.0, min:100, fee:12, gst:0.05, factor:1.00 }
 };
 const WAIT = { freeMin: 3, perMin: 2 };
 const CANCEL = { graceSec: 120, fee: 25 };
@@ -108,7 +107,7 @@ async function candidates(pickup, cls) {
     if (loc.state !== 'idle') return;
     if (now - loc.ts > STALE_MS) return;
     if (prof.onlineSince && (now - prof.onlineSince) / 3600000 > FATIGUE_HOURS) return;
-    if (prof.cls !== cls && !(cls === 'parcel' && prof.cls === 'bike')) return;
+    if (prof.cls !== cls) return;
     const km = haversine(loc, pickup);
     if (km > 20) return;   // driver search radius
     out.push({ uid, prof, loc, km, score: km - ((prof.rating || 4.5) - 4) * 0.8 });
@@ -228,3 +227,4 @@ module.exports = {
   fareFor, routeMetrics, haversine, candidates, advance,
   sign, verifyLock, auth, adminOnly
 };
+
