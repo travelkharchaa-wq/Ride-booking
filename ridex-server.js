@@ -28,6 +28,9 @@ app.use(express.json({ limit: '4mb' }));
 
 app.get('/health', (_, res) => res.json({ ok: true, at: Date.now() }));
 
+/* Pool routes first: they intercept /ride/complete, /ride/cancel and
+   /ride/driver-cancel for pooled rides and pass everything else through. */
+app.use(require('./pool-routes'));
 app.use(require('./rider'));
 app.use(require('./driver'));
 
@@ -50,3 +53,4 @@ process.on('uncaughtException', err => {
 
 const port = process.env.PORT || 8090;
 app.listen(port, () => console.log('RideX API listening on ' + port));
+
