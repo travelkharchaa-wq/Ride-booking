@@ -18,9 +18,15 @@ const express = require('express');
 const C = require('./core');
 const Pool = require('./pool');
 const router = express.Router();
+
+/* pool.js must be the matching-rules file. If it was overwritten with other
+   code, say so plainly in the logs instead of failing on every shared booking. */
+if (typeof Pool.evaluateMatch !== 'function' || typeof Pool.canPool !== 'function')
+  console.error('pool.js does not contain the pooling rules — shared rides will fail. ' +
+                'Replace pool.js with the rules file (it should end with module.exports = { ... canPool ... }).');
 const { db, admin, COMMISSION, CANCEL } = C;
 
-const SEARCH_KM = 5;        // how far a moving driver may be from P2's pickup
+const SEARCH_KM = 8;        // how far a moving driver may be from P2's pickup
 const MAX_CHECKS = 3;       // candidate trips examined per search
 const ROUTE_TIMEOUT_MS = 5000;   // one routing call
 const FIND_BUDGET_MS = 12000;    // the whole search, well inside the request limit
