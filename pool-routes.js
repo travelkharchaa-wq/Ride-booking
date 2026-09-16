@@ -95,10 +95,17 @@ async function settle(p1Id) {
   return val('rides/' + p1Id);
 }
 
-function push(token, title, body) {
+/* What the driver actually keeps from a fare: the extra (detour) charge is
+   not commissionable, the rest is. */
+function driverEarn(pays, surcharge) {
+  const extra = surcharge || 0;
+  return pays - Math.round((pays - extra) * COMMISSION);
+}
+
+function push(token, title, body, url, tag) {
   if (!token) return;
   admin.messaging().send({
-    token, data: { title, body },
+    token, data: { title, body, url: url || '/drive/', tag: tag || 'ridex-offer' },
     android: { priority: 'high' },
     webpush: { headers: { Urgency: 'high', TTL: String(Pool.OFFER_SEC) } }
   }).catch(err => console.warn('pool push failed:', err.code || err.message));
@@ -166,8 +173,15 @@ router.post('/pool/find', C.auth, async (req, res) => {
 
       /* Claim P1 atomically so two waiting riders can't both be offered
          the same seat. */
+      const sp = verdict.split;
+      /* Net change in the driver's earnings: everything from P2, minus what
+         the driver loses because P1 now pays the shared (lower) fare. */
+      const driverGain = driverEarn(sp.p2.pays, sp.p2.surcharge)
+        - (driverEarn(sp.p1.was, 0) - driverEarn(sp.p1.pays, 0));
       const ask = {
         p2RideId: p2Id, stage: 'rider', tries: 1,
+        surcharge: sp.p2.surcharge, pickupDetourKm: verdict.pickupDetourKm || 0,
+        driverGain,
         expires: Date.now() + Pool.OFFER_SEC * 1000,
         order: verdict.order, split: verdict.split,
         addedKm: verdict.addedKm, addedMin: verdict.addedMin,
@@ -187,6 +201,13 @@ router.post('/pool/find', C.auth, async (req, res) => {
       const fresh = await val('rides/' + p2Id + '/currentOffer');
       if (fresh) up['offers/' + fresh.uid + '/' + fresh.offerId] = null;
       await ref().update(up);
+
+      /* Ring the first rider's phone even if RideX is in the background. */
+      const p1Rider = await val('riders/' + c.p1.riderUid);
+      push(p1Rider && p1Rider.fcmToken,
+           'Share your ride? Save \u20b9' + sp.p1.saves,
+           'A rider heading your way would like to join. Tap to accept or decline.',
+           '/app/', 'ridex-pool');
 
       return res.json({
         matched: true,
@@ -215,6 +236,15 @@ router.get('/pool/status/:rideId', C.auth, async (req, res) => {
     pooled: !!now.poolWith,
     fare: now.poolFare || null
   });
+});
+
+/* Rider push token, so a shared-ride request reaches the first rider even
+   when the app is in the background. */
+router.post('/rider/token', C.auth, async (req, res) => {
+  const token = String(req.body.token || '').slice(0, 400);
+  if (!token) return res.status(400).json({ error: 'Missing token.' });
+  await ref('riders/' + req.user.uid).update({ fcmToken: token, fcmUpdatedAt: Date.now() });
+  res.json({ ok: true });
 });
 
 /* ── 2. P1 is asked ── */
@@ -253,7 +283,7 @@ router.post('/pool/respond', C.auth, async (req, res) => {
   });
   const prof = await val('drivers/' + p1.driverUid);
   push(prof && prof.fcmToken,
-       'Shared ride request · +\u20b9' + Pool.P2_SURCHARGE,
+       'Shared ride request · earn \u20b9' + (a.driverGain != null ? a.driverGain : a.surcharge) + ' more',
        a.p2Pickup + ' \u2192 ' + a.p2Drop);
   res.json({ ok: true, accepted: true });
 });
@@ -274,7 +304,8 @@ router.get('/pool/driver', C.auth, async (req, res) => {
     ask = {
       pickup: a.p2Pickup, drop: a.p2Drop,
       addedMin: a.addedMin, addedKm: a.addedKm,
-      extra: Pool.P2_SURCHARGE, expires: a.expires
+      extra: a.driverGain != null ? a.driverGain : (a.surcharge || Pool.P2_SURCHARGE),
+      pickupDetourKm: a.pickupDetourKm || 0, expires: a.expires
     };
   }
 
@@ -290,7 +321,9 @@ router.get('/pool/driver', C.auth, async (req, res) => {
       pickup: r.addr[0], drop: last(r.addr),
       pickupLat: r.points[0].lat, pickupLng: r.points[0].lng,
       dropLat: last(r.points).lat, dropLng: last(r.points).lng,
-      collect: r.poolFare ? r.poolFare.pays + (r.waitCharge || 0) + (r.boost || 0) : null
+      earn: r.poolFare
+        ? driverEarn(r.poolFare.pays + (r.waitCharge || 0) + (r.boost || 0), r.poolFare.surcharge)
+        : null
     });
     plan = { order: p1 && p1.poolOrder, p1: card(p1Id, p1), p2: card(p2Id, p2) };
   }
