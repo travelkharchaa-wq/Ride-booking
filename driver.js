@@ -23,8 +23,13 @@ function checkDoc(d, label) {
 
 router.post('/driver/apply', C.auth, async (req, res) => {
   const uid = req.user.uid;
-  if ((await db.ref('drivers/' + uid + '/status').once('value')).val() === 'approved')
+  const existing = (await db.ref('drivers/' + uid).once('value')).val() || {};
+  if (existing.status === 'approved')
     return res.json({ ok: true, status: 'approved' });
+  /* A suspended driver must not be able to resubmit their way back into the
+     approval queue; an admin lifts the suspension or deletes the account. */
+  if (existing.status === 'suspended')
+    return res.status(403).json({ error: 'Your account is suspended. Please contact RideX support.' });
 
   const { name, cls, plate, model, licence, licenceDoc, rcDoc, acceptedTerms } = req.body;
 
@@ -47,7 +52,10 @@ router.post('/driver/apply', C.auth, async (req, res) => {
       plate: String(plate || '').toUpperCase().slice(0, 15),
       model: String(model || '').slice(0, 40),
       licence: String(licence || '').slice(0, 25),
-      status: 'pending', rating: 5.0, trips: 0, dues: 0,
+      /* Editing a pending application keeps any history from before —
+         e.g. a driver who was approved, changed vehicle, then corrected it. */
+      status: 'pending', rating: existing.rating || 5.0,
+      trips: existing.trips || 0, dues: existing.dues || 0,
       hasDocs: true,
       termsVersion: '1.0',
       termsAcceptedAt: admin.database.ServerValue.TIMESTAMP,
@@ -57,6 +65,45 @@ router.post('/driver/apply', C.auth, async (req, res) => {
       licenceDoc, rcDoc, at: admin.database.ServerValue.TIMESTAMP
     }
   });
+  res.json({ ok: true, status: 'pending' });
+});
+
+/* An approved driver switching vehicle (say bike to car). The new vehicle must
+   be verified before it carries anyone, so the account returns to pending
+   with the new RC on file. Trips, rating and dues are kept. */
+router.post('/driver/vehicle', C.auth, async (req, res) => {
+  const uid = req.user.uid;
+  const prof = (await db.ref('drivers/' + uid).once('value')).val();
+  if (!prof || prof.status !== 'approved')
+    return res.status(409).json({ error: 'Only approved drivers can change vehicle.' });
+  if ((await db.ref('driverActive/' + uid).once('value')).val())
+    return res.status(409).json({ error: 'Finish your current trip before changing vehicle.' });
+
+  const { cls, plate, model, rcDoc } = req.body;
+  if (!CLASSES[cls]) return res.status(400).json({ error: 'Please choose a vehicle type.' });
+  const cleanPlate = String(plate || '').toUpperCase().trim().slice(0, 15);
+  if (cleanPlate.length < 4) return res.status(400).json({ error: 'Please enter your number plate.' });
+  const e = checkDoc(rcDoc, 'Vehicle RC');
+  if (e) return res.status(400).json({ error: e });
+
+  const up = {};
+  up['drivers/' + uid + '/cls'] = cls;
+  up['drivers/' + uid + '/plate'] = cleanPlate;
+  up['drivers/' + uid + '/model'] = String(model || '').slice(0, 40);
+  up['drivers/' + uid + '/status'] = 'pending';
+  up['drivers/' + uid + '/onlineSince'] = null;
+  up['drivers/' + uid + '/previousVehicle'] = { cls: prof.cls, plate: prof.plate || '', model: prof.model || '' };
+  up['drivers/' + uid + '/vehicleChangedAt'] = admin.database.ServerValue.TIMESTAMP;
+  up['driverDocs/' + uid + '/rcDoc'] = rcDoc;
+  up['driverDocs/' + uid + '/at'] = admin.database.ServerValue.TIMESTAMP;
+  up['offers/' + uid] = null;
+
+  // off the dispatch map straight away, not after the heartbeat goes stale
+  const loc = (await db.ref('driverLoc/' + uid).once('value')).val();
+  if (loc && loc.gh) up['geo/' + loc.gh + '/' + uid] = null;
+  if (loc) up['driverLoc/' + uid + '/state'] = 'offline';
+
+  await db.ref().update(up);
   res.json({ ok: true, status: 'pending' });
 });
 
@@ -100,7 +147,9 @@ router.post('/driver/beat', C.auth, async (req, res) => {
   const prof = (await db.ref('drivers/' + uid).once('value')).val();
   if (!prof) return res.json({ status: 'none' });
   if (prof.status !== 'approved')
-    return res.json({ status: prof.status, name: prof.name || null });
+    return res.json({ status: prof.status, name: prof.name || null, cls: prof.cls || null,
+                      plate: prof.plate || null, model: prof.model || null,
+                      licence: prof.licence || null, vehicleChange: !!prof.vehicleChangedAt });
 
   const { lat, lng, online } = req.body;
   const now = Date.now();
@@ -446,6 +495,35 @@ router.post('/admin/driver/status', C.auth, C.adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* Removes a driver's account so the same phone number can apply again from
+   scratch. Their login is untouched (the same number may also be a rider),
+   and trip ledger and settlement records are kept for accounting. */
+router.post('/admin/driver/delete', C.auth, C.adminOnly, async (req, res) => {
+  const uid = String(req.body.uid || '');
+  if (!uid) return res.status(400).json({ error: 'Missing uid.' });
+  const prof = (await db.ref('drivers/' + uid).once('value')).val();
+  if (!prof) return res.status(404).json({ error: 'This driver no longer exists.' });
+  if ((await db.ref('driverActive/' + uid).once('value')).val())
+    return res.status(409).json({ error: 'This driver is on a trip. Cancel or reassign the ride first.' });
+  if ((prof.dues || 0) > 0 && req.body.confirmDues !== true)
+    return res.status(409).json({ error: 'This driver owes \u20b9' + prof.dues + ' in commission.', dues: prof.dues });
+
+  const up = {};
+  up['drivers/' + uid] = null;
+  up['driverDocs/' + uid] = null;
+  up['driverLoc/' + uid] = null;
+  up['offers/' + uid] = null;
+  const loc = (await db.ref('driverLoc/' + uid).once('value')).val();
+  if (loc && loc.gh) up['geo/' + loc.gh + '/' + uid] = null;
+  up['deletedDrivers/' + uid + '/' + Date.now()] = {
+    name: prof.name || '', phone: prof.phone || '', cls: prof.cls || '',
+    plate: prof.plate || '', trips: prof.trips || 0, dues: prof.dues || 0,
+    by: req.user.uid
+  };
+  await db.ref().update(up);
+  res.json({ ok: true });
+});
+
 /* Lets an admin actually look at the licence and RC before approving. */
 router.get('/admin/driver/docs', C.auth, C.adminOnly, async (req, res) => {
   const uid = req.query.uid;
@@ -466,4 +544,33 @@ router.post('/admin/driver/settle', C.auth, C.adminOnly, async (req, res) => {
 });
 
 router.get('/admin/live', C.auth, C.adminOnly, async (req, res) => {
-  
+  const now = Date.now();
+  const [rideSnap, sosSnap] = await Promise.all([
+    db.ref('rides').orderByChild('createdAt').startAt(now - 12 * 3600 * 1000).once('value'),
+    db.ref('sos').limitToLast(50).once('value')
+  ]);
+
+  const active = [];
+  rideSnap.forEach(c => {
+    const r = c.val();
+    if (!r || !['searching', 'pool_pending', 'assigned', 'arrived', 'ontrip'].includes(r.state)) return;
+    active.push({
+      id: c.key, state: r.state,
+      rider: r.riderName || 'Rider',
+      driver: r.driver ? r.driver.name : null,
+      fare: r.poolFare ? r.poolFare.pays : (r.fare ? r.fare.total : 0),
+      from: (r.addr && r.addr[0]) || '',
+      to: (r.addr && r.addr[r.addr.length - 1]) || '',
+      at: r.createdAt || 0
+    });
+  });
+  active.sort((a, b) => b.at - a.at);
+
+  const alerts = [];
+  sosSnap.forEach(c => { alerts.push(Object.assign({ id: c.key }, c.val())); });
+  alerts.sort((a, b) => (b.at || 0) - (a.at || 0));
+
+  res.json({ active, alerts, at: now });
+});
+
+module.exports = router;
