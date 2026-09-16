@@ -100,7 +100,7 @@ router.post('/ride/create', C.auth, async (req, res) => {
   const openId = (await db.ref('riderActive/' + req.user.uid).once('value')).val();
   if (openId) {
     const open = (await db.ref('rides/' + openId).once('value')).val();
-    const LIVE = ['searching', 'assigned', 'arrived', 'ontrip'];
+    const LIVE = ['searching', 'pool_pending', 'assigned', 'arrived', 'ontrip'];
     const stale = !open
       || !LIVE.includes(open.state)
       || (Date.now() - (open.createdAt || 0) > 2 * 60 * 60 * 1000);
@@ -325,4 +325,3 @@ router.post('/ride/boost', C.auth, async (req, res) => {
 });
 
 module.exports = router;
-            
