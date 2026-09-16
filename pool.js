@@ -42,7 +42,7 @@ const SHARE_DISCOUNT = 0.50;    // fare reduction on the shared segment
 const POOL_CLASSES = ['auto', 'mini', 'prime'];
 const POOL_SEATS   = { auto: 3, mini: 4, prime: 6 };
 
-const OFFER_SEC   = 30;         // how long P1 has to answer one request
+const OFFER_SEC   = 45;         // how long P1 has to answer one request (rings throughout)
 const OFFER_TRIES = 2;          // how many times the same rider is asked
 
 /* Both riders must be in a class that pools, and in the same class — someone
