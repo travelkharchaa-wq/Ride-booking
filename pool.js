@@ -22,7 +22,17 @@ const MAX_DETOUR_MIN   = 15;    // added time for ONE detour — a safety cap fo
    the one outcome that would destroy trust in the feature. ₹30 with a 50%
    discount leaves both riders ahead on every pairing tested, and still pays
    the driver roughly ₹53 extra per pooled trip. */
-const P2_SURCHARGE   = 30;      // paid by P2, passed to the driver untouched
+const P2_SURCHARGE   = 30;      // MINIMUM extra paid by P2, passed to the driver untouched
+
+/* The extra is priced on the real extra distance the driver drives to collect
+   P2 and come back onto the route — ₹20 per km, never less than ₹30. A pickup
+   right on the route pays the minimum; one 2.5 km off the road (≈5 km there
+   and back) pays ₹100. */
+const DETOUR_RATE_PER_KM = 20;
+function detourCharge(pickupDetourKm) {
+  const km = Math.max(0, Number(pickupDetourKm) || 0);
+  return Math.max(P2_SURCHARGE, Math.round(km * DETOUR_RATE_PER_KM));
+}
 const SHARE_DISCOUNT = 0.50;    // fare reduction on the shared segment
 
 /* Sharing needs a spare seat and a second stranger in the vehicle.
@@ -147,7 +157,8 @@ function detourWithinLimits(original, withPool) {
    surcharge passed to the driver untouched — the driver does more work for
    the same trip, and that has to be worth their while or they will decline
    every pool and the feature dies whatever the app does. */
-function splitFares(p1, p2, sharedKm) {
+function splitFares(p1, p2, sharedKm, surcharge) {
+  const extra = surcharge == null ? P2_SURCHARGE : surcharge;
   const p1Shared = Math.min(sharedKm, p1.km);
   const p2Shared = Math.min(sharedKm, p2.km);
 
@@ -157,14 +168,14 @@ function splitFares(p1, p2, sharedKm) {
     ? Math.round((p2Shared / p2.km) * p2.total * SHARE_DISCOUNT) : 0;
 
   const p1Pays = Math.max(0, p1.total - p1Discount);
-  const p2Pays = Math.max(0, p2.total - p2Discount) + P2_SURCHARGE;
+  const p2Pays = Math.max(0, p2.total - p2Discount) + extra;
 
   return {
     sharedKm: +sharedKm.toFixed(2),
     p1: { was: p1.total, pays: p1Pays, saves: p1Discount },
-    p2: { was: p2.total, pays: p2Pays, saves: p2Discount, surcharge: P2_SURCHARGE },
+    p2: { was: p2.total, pays: p2Pays, saves: p2Discount, surcharge: extra },
     // the surcharge is not commissionable — it exists to compensate the driver
-    driverExtra: P2_SURCHARGE
+    driverExtra: extra
   };
 }
 
@@ -239,7 +250,8 @@ function evaluateMatch(ongoing, waiting, routes) {
     sharedKm = routes.viaPickup.legs[1].km;        // P2 pickup → P1 drop, together
   }
 
-  const split = splitFares(ongoing.fare, waiting.fare, sharedKm);
+  const surcharge = detourCharge(pick.addedKm);
+  const split = splitFares(ongoing.fare, waiting.fare, sharedKm, surcharge);
   const worth = poolIsWorthwhile(split);
   if (!worth.ok) return no(worth.reason);
 
@@ -247,6 +259,7 @@ function evaluateMatch(ongoing, waiting, routes) {
     ok: true,
     offRouteKm: near.offRouteKm,
     dropKind: plan.kind,
+    pickupDetourKm: Math.max(0, pick.addedKm),
     // what the first rider sits through: the pickup detour, plus the drop
     // detour only when P2 leaves before them
     addedKm: +(pick.addedKm + drop.addedKm).toFixed(2),
@@ -259,7 +272,7 @@ function evaluateMatch(ongoing, waiting, routes) {
 
 module.exports = {
   PICKUP_RADIUS_KM, DROP_RADIUS_KM, MAX_DETOUR_KM, MAX_DETOUR_MIN,
-  P2_SURCHARGE, SHARE_DISCOUNT,
+  P2_SURCHARGE, DETOUR_RATE_PER_KM, detourCharge, SHARE_DISCOUNT,
   POOL_CLASSES, POOL_SEATS, OFFER_SEC, OFFER_TRIES,
   MIN_P1_SAVING, MIN_P2_SAVING,
   POOL_GENDERS,
