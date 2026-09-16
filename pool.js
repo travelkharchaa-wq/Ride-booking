@@ -6,13 +6,15 @@
  * rider real time, so the checks are strict and fail closed.
  */
 
-/* A second rider may be picked up up to 3 km off the first rider's route.
-   Reaching a pickup that far away and coming back onto the route can add
-   close to twice that distance, so the detour limits are sized to match —
-   otherwise the detour check would silently cap the usable range. */
+/* Detour rules, applied separately to P2's pickup and P2's drop:
+     - the point may be up to 3 km off the first rider's route, and
+     - going there and coming back onto the route may add at most 6 km.
+   A drop that lies beyond the first rider's destination needs no detour at
+   all: the driver drops the first rider, then carries on. */
 const PICKUP_RADIUS_KM = 3.0;   // how far off-route P2's pickup may be
-const MAX_DETOUR_KM    = 6.0;   // added distance vs the original trip
-const MAX_DETOUR_MIN   = 12;    // added time vs the original trip
+const DROP_RADIUS_KM   = 3.0;   // how far off-route P2's drop may be (if before P1's)
+const MAX_DETOUR_KM    = 6.0;   // added distance for ONE detour (there and back)
+const MAX_DETOUR_MIN   = 15;    // added time for ONE detour — a safety cap for traffic
 
 /* Modelled against real Rewari fares (₹100–320). At a ₹50 surcharge with a
    40% discount, only a third of realistic trip pairings left P2 better off
@@ -82,6 +84,40 @@ function projectOnRoute(point, line) {
     acc += segLen;
   }
   return { km: best, at: bestAt, routeKm: total };
+}
+
+/* Where a point sits relative to the route: how far off it, how far along
+   (0–1, measured at the actual closest point), and whether it lies beyond
+   the destination — i.e. its closest point is the route's end and it is
+   further from the start than the destination is. */
+function positionOnRoute(point, line) {
+  let best = Infinity, bestAt = 0, bestI = 0, acc = 0, total = 0;
+  const lens = [];
+  for (let i = 0; i < line.length - 1; i++) { lens.push(haversine(line[i], line[i+1])); total += lens[i]; }
+  for (let i = 0; i < line.length - 1; i++) {
+    const a = line[i], b = line[i+1];
+    const toXY = q => ({ x: q.lng * Math.cos(rad((a.lat + b.lat) / 2)) * 111.32, y: q.lat * 110.57 });
+    const P = toXY(point), A = toXY(a), B = toXY(b);
+    const dx = B.x - A.x, dy = B.y - A.y, len2 = dx*dx + dy*dy;
+    const t = len2 ? Math.max(0, Math.min(1, ((P.x - A.x) * dx + (P.y - A.y) * dy) / len2)) : 0;
+    const d = Math.hypot(P.x - (A.x + t*dx), P.y - (A.y + t*dy));
+    if (d < best) { best = d; bestI = i; bestAt = total ? (acc + t * lens[i]) / total : 0; }
+    acc += lens[i];
+  }
+  const start = line[0], end = line[line.length - 1];
+  const beyondEnd = bestAt >= 0.97 && haversine(start, point) > haversine(start, end);
+  return { km: best, at: bestAt, beyondEnd, routeKm: total };
+}
+
+/* How P2's drop fits the first rider's trip:
+     'after'  — past P1's destination: drop P1 first, no detour for P1
+     'before' — within 3 km of the route: a detour to check (≤ 6 km)
+     'off'    — neither: not a match */
+function dropPlan(drop, line) {
+  const pos = positionOnRoute(drop, line);
+  if (pos.beyondEnd) return { kind: 'after', offRouteKm: +pos.km.toFixed(2), at: pos.at };
+  if (pos.km <= DROP_RADIUS_KM) return { kind: 'before', offRouteKm: +pos.km.toFixed(2), at: pos.at };
+  return { kind: 'off', offRouteKm: +pos.km.toFixed(2), at: pos.at };
 }
 
 /* Is this pickup close enough to the road the driver is already on? */
@@ -159,7 +195,14 @@ function dropOrder(p1DropAt, p2DropAt) {
 }
 
 /* Single entry point: can this waiting rider join that moving trip?
-   Fails closed — any missing input is a rejection, never a maybe. */
+   Fails closed — any missing input is a rejection, never a maybe.
+
+   routes (from the routing server):
+     line       — road shape of the trip as it stands (driver → P1's drop)
+     original   — that trip's totals
+     viaPickup  — driver → P2 pickup → P1 drop
+     viaDrop    — driver → P2 pickup → P2 drop → P1 drop  (only when P2's
+                  drop comes before P1's; see dropPlan) */
 function evaluateMatch(ongoing, waiting, routes) {
   const no = reason => ({ ok: false, reason });
 
@@ -173,35 +216,55 @@ function evaluateMatch(ongoing, waiting, routes) {
      profile is never pooled, because we cannot confirm the match. */
   if (!gendersCompatible(ongoing.riderGender, waiting.riderGender))
     return no('gender mismatch');
+  if (!routes.line || !routes.original || !routes.viaPickup) return no('missing route');
 
+  // pickup: within 3 km of the route, and at most 6 km there and back
   const near = pickupIsNearRoute(waiting.pickup, routes.line);
   if (!near.ok) return no('pickup ' + near.offRouteKm + ' km off route');
+  const pick = detourWithinLimits(routes.original, routes.viaPickup);
+  if (!pick.ok) return no('pickup detour +' + pick.addedKm + ' km / +' + pick.addedMin + ' min');
 
-  const det = detourWithinLimits(routes.original, routes.withPool);
-  if (!det.ok) return no('detour +' + det.addedKm + ' km / +' + det.addedMin + ' min');
+  // drop: past P1's destination is always fine; otherwise within 3 km / 6 km
+  const plan = dropPlan(waiting.drop, routes.line);
+  if (plan.kind === 'off') return no('drop ' + plan.offRouteKm + ' km off route');
 
-  const split = splitFares(ongoing.fare, waiting.fare, routes.sharedKm);
+  let drop = { addedKm: 0, addedMin: 0 };
+  let sharedKm;
+  if (plan.kind === 'before') {
+    if (!routes.viaDrop) return no('missing drop route');
+    drop = detourWithinLimits(routes.viaPickup, routes.viaDrop);
+    if (!drop.ok) return no('drop detour +' + drop.addedKm + ' km / +' + drop.addedMin + ' min');
+    sharedKm = routes.viaDrop.legs[1].km;          // P2 pickup → P2 drop, together
+  } else {
+    sharedKm = routes.viaPickup.legs[1].km;        // P2 pickup → P1 drop, together
+  }
+
+  const split = splitFares(ongoing.fare, waiting.fare, sharedKm);
   const worth = poolIsWorthwhile(split);
   if (!worth.ok) return no(worth.reason);
 
-  const p2At = projectOnRoute(waiting.drop, routes.line).at;
   return {
     ok: true,
     offRouteKm: near.offRouteKm,
-    addedKm: det.addedKm, addedMin: det.addedMin,
+    dropKind: plan.kind,
+    // what the first rider sits through: the pickup detour, plus the drop
+    // detour only when P2 leaves before them
+    addedKm: +(pick.addedKm + drop.addedKm).toFixed(2),
+    addedMin: pick.addedMin + drop.addedMin,
     split,
-    order: dropOrder(1, p2At)   // P1's drop is the end of the route, at = 1
+    // a suggestion for the driver's screen; either rider can be dropped first
+    order: plan.kind === 'before' ? ['p2', 'p1'] : ['p1', 'p2']
   };
 }
 
 module.exports = {
-  PICKUP_RADIUS_KM, MAX_DETOUR_KM, MAX_DETOUR_MIN,
+  PICKUP_RADIUS_KM, DROP_RADIUS_KM, MAX_DETOUR_KM, MAX_DETOUR_MIN,
   P2_SURCHARGE, SHARE_DISCOUNT,
   POOL_CLASSES, POOL_SEATS, OFFER_SEC, OFFER_TRIES,
   MIN_P1_SAVING, MIN_P2_SAVING,
   POOL_GENDERS,
   canPool, classesCompatible, gendersCompatible,
-  haversine, distToSegment, projectOnRoute,
+  haversine, distToSegment, projectOnRoute, positionOnRoute, dropPlan,
   pickupIsNearRoute, detourWithinLimits,
   splitFares, poolIsWorthwhile, dropOrder, evaluateMatch
 };
