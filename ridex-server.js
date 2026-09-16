@@ -2,7 +2,40 @@
 const express = require('express');
 const cors = require('cors');
 
+/* Express 4 does not catch errors from async route handlers. When one threw,
+   the request simply never got a reply, and the Netlify proxy in front gave
+   up after ~26 s with a 504 — the "Request failed (504)" riders saw. This
+   routes every async failure to the error handler below, so the caller gets
+   a real error immediately instead of a timeout. */
+try {
+  const Layer = require('express/lib/router/layer');   // Express 4 only
+  const handle = Layer.prototype.handle_request;
+  Layer.prototype.handle_request = function (req, res, next) {
+    const fn = this.handle;
+    if (fn.length > 3) return handle.call(this, req, res, next);
+    try {
+      const out = fn(req, res, next);
+      if (out && typeof out.catch === 'function') out.catch(next);
+    } catch (err) { next(err); }
+  };
+} catch (e) { /* Express 5 already handles async errors */ }
+
+/* A hard ceiling below the proxy's own limit, so a slow dependency returns a
+   clear message rather than an opaque 504. */
+const REQUEST_LIMIT_MS = 20000;
+
 const app = express();
+app.use((req, res, next) => {
+  const t = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error('Request timed out: ' + req.method + ' ' + req.path);
+      res.status(503).json({ error: 'The server is busy. Please try again.' });
+    }
+  }, REQUEST_LIMIT_MS);
+  res.on('finish', () => clearTimeout(t));
+  res.on('close', () => clearTimeout(t));
+  next();
+});
 app.use(cors({ origin: (process.env.RIDEX_ORIGINS || '*').split(',') }));
 
 /* Every response is explicitly marked as never cacheable. Without this, a GET
@@ -53,4 +86,3 @@ process.on('uncaughtException', err => {
 
 const port = process.env.PORT || 8090;
 app.listen(port, () => console.log('RideX API listening on ' + port));
-
