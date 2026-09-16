@@ -21,7 +21,9 @@ const router = express.Router();
 const { db, admin, COMMISSION, CANCEL } = C;
 
 const SEARCH_KM = 5;        // how far a moving driver may be from P2's pickup
-const MAX_CHECKS = 4;       // routing calls per search, to spare the OSRM server
+const MAX_CHECKS = 3;       // candidate trips examined per search
+const ROUTE_TIMEOUT_MS = 5000;   // one routing call
+const FIND_BUDGET_MS = 12000;    // the whole search, well inside the request limit
 
 const ref = p => db.ref(p);
 const val = async p => (await ref(p).once('value')).val();
@@ -31,8 +33,15 @@ const last = arr => arr[arr.length - 1];
    because matching needs the road line and not just totals. */
 async function route(points) {
   const coords = points.map(p => p.lng + ',' + p.lat).join(';');
-  const res = await fetch('https://router.project-osrm.org/route/v1/driving/' +
-                          coords + '?overview=full&geometries=geojson');
+  /* The public routing server sometimes stalls. Without a timeout one slow
+     call held the request open until the proxy returned a 504. */
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ROUTE_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch('https://router.project-osrm.org/route/v1/driving/' +
+                      coords + '?overview=full&geometries=geojson', { signal: ctl.signal });
+  } finally { clearTimeout(timer); }
   if (!res.ok) throw new Error('routing unavailable');
   const j = await res.json();
   const r = j.routes && j.routes[0];
@@ -120,7 +129,9 @@ router.post('/pool/find', C.auth, async (req, res) => {
   }));
   list.sort((a, b) => a.km - b.km);
 
+  const started = Date.now();
   for (const c of list.slice(0, MAX_CHECKS)) {
+    if (Date.now() - started > FIND_BUDGET_MS) break;   // try again on the next poll
     try {
       const p1Drop = last(c.p1.points);
       const original = await route([c.loc, p1Drop]);
@@ -190,6 +201,7 @@ router.get('/pool/status/:rideId', C.auth, async (req, res) => {
   const now = await val('rides/' + req.params.rideId);
   res.json({
     state: now.state,
+    shared: !!now.shared,
     pooled: !!now.poolWith,
     fare: now.poolFare || null
   });
@@ -450,4 +462,3 @@ function unlinkPartner(ride) {
 }
 
 module.exports = router;
-      
