@@ -4,7 +4,8 @@
  *   1. P2 books normally with shared:true, then calls POST /pool/find.
  *      If a moving shared trip fits (pool.js rules), dispatch for P2 pauses.
  *   2. P1 is asked:      GET /pool/ask/:rideId  →  POST /pool/respond
- *   3. Driver is asked:  GET /pool/driver       →  POST /pool/driver-respond
+ *   3. On P1's accept the co-rider is added straight away. The driver is
+ *      informed (rings until OK):  GET /pool/driver  →  POST /pool/notice-ack
  *   4. Linked. P2 is picked up with the existing /ride/arrived and /ride/start
  *      (P2's own OTP). Drops go through /ride/complete, which this file
  *      intercepts for pooled rides so the fare split is applied (any drop order).
@@ -84,7 +85,7 @@ async function settle(p1Id) {
   if (!ask) return p1;
   if (Date.now() < ask.expires) return p1;
 
-  if (ask.stage === 'rider' && (ask.tries || 1) < Pool.OFFER_TRIES) {
+  if ((ask.tries || 1) < Pool.OFFER_TRIES) {
     await ref('rides/' + p1Id + '/poolAsk').update({
       tries: (ask.tries || 1) + 1,
       expires: Date.now() + Pool.OFFER_SEC * 1000
@@ -176,12 +177,15 @@ router.post('/pool/find', C.auth, async (req, res) => {
       const sp = verdict.split;
       /* Net change in the driver's earnings: everything from P2, minus what
          the driver loses because P1 now pays the shared (lower) fare. */
-      const driverGain = driverEarn(sp.p2.pays, sp.p2.surcharge)
-        - (driverEarn(sp.p1.was, 0) - driverEarn(sp.p1.pays, 0));
+      const coRiderEarn = driverEarn(sp.p2.pays - sp.p2.surcharge, 0);
+      const p1DiscountLoss = driverEarn(sp.p1.was, 0) - driverEarn(sp.p1.pays, 0);
+      const driverGain = coRiderEarn + sp.p2.surcharge - p1DiscountLoss;
       const ask = {
         p2RideId: p2Id, stage: 'rider', tries: 1,
         surcharge: sp.p2.surcharge, pickupDetourKm: verdict.pickupDetourKm || 0,
         driverGain,
+        /* the breakdown shown to the driver when the co-rider is added */
+        coRiderKm: p2.fare.km, coRiderEarn, p1DiscountLoss,
         expires: Date.now() + Pool.OFFER_SEC * 1000,
         order: verdict.order, split: verdict.split,
         addedKm: verdict.addedKm, addedMin: verdict.addedMin,
@@ -278,81 +282,22 @@ router.post('/pool/respond', C.auth, async (req, res) => {
     return res.json({ ok: true, accepted: false });
   }
 
-  await ref('rides/' + p1Id + '/poolAsk').update({
-    stage: 'driver', expires: Date.now() + Pool.OFFER_SEC * 1000
-  });
-  const prof = await val('drivers/' + p1.driverUid);
-  push(prof && prof.fcmToken,
-       'Shared ride request · earn \u20b9' + (a.driverGain != null ? a.driverGain : a.surcharge) + ' more',
-       a.p2Pickup + ' \u2192 ' + a.p2Drop);
+  const linked = await linkPool(p1Id, p1, a);
+  if (!linked.ok) return res.status(409).json({ error: linked.error });
   res.json({ ok: true, accepted: true });
 });
 
-/* ── 3. Driver is asked, and sees the pooled plan once linked ── */
-router.get('/pool/driver', C.auth, async (req, res) => {
-  const uid = req.user.uid;
-  const activeId = await val('driverActive/' + uid);
-  if (!activeId) return res.json({ ask: null, plan: null });
-
-  let cur = await val('rides/' + activeId);
-  if (cur && cur.poolAsk) cur = await settle(activeId);
-  if (!cur || cur.driverUid !== uid) return res.json({ ask: null, plan: null });
-
-  let ask = null;
-  if (cur.poolAsk && cur.poolAsk.stage === 'driver') {
-    const a = cur.poolAsk;
-    ask = {
-      pickup: a.p2Pickup, drop: a.p2Drop,
-      addedMin: a.addedMin, addedKm: a.addedKm,
-      extra: a.driverGain != null ? a.driverGain : (a.surcharge || Pool.P2_SURCHARGE),
-      pickupDetourKm: a.pickupDetourKm || 0, expires: a.expires
-    };
-  }
-
-  let plan = null;
-  if (cur.poolWith) {
-    const other = await val('rides/' + cur.poolWith);
-    const p1 = cur.poolRole === 'p1' ? cur : other;
-    const p2 = cur.poolRole === 'p2' ? cur : other;
-    const p1Id = cur.poolRole === 'p1' ? activeId : cur.poolWith;
-    const p2Id = cur.poolRole === 'p2' ? activeId : cur.poolWith;
-    const card = (id, r) => r && ({
-      rideId: id, state: r.state, riderName: r.riderName, riderPhone: r.riderPhone,
-      pickup: r.addr[0], drop: last(r.addr),
-      pickupLat: r.points[0].lat, pickupLng: r.points[0].lng,
-      dropLat: last(r.points).lat, dropLng: last(r.points).lng,
-      earn: r.poolFare
-        ? driverEarn(r.poolFare.pays + (r.waitCharge || 0) + (r.boost || 0), r.poolFare.surcharge)
-        : null
-    });
-    plan = { order: p1 && p1.poolOrder, p1: card(p1Id, p1), p2: card(p2Id, p2) };
-  }
-  res.json({ ask, plan });
-});
-
-router.post('/pool/driver-respond', C.auth, async (req, res) => {
-  const uid = req.user.uid;
-  const p1Id = await val('driverActive/' + uid);
-  const p1 = p1Id && await settle(p1Id);
-  if (!p1 || p1.driverUid !== uid)
-    return res.status(403).json({ error: 'Not your ride.' });
-  const a = p1.poolAsk;
-  if (!a || a.stage !== 'driver')
-    return res.status(409).json({ error: 'That request has expired.' });
-
-  if (req.body.accept !== true) {
-    await releaseAsk(p1Id, a);
-    return res.json({ ok: true, accepted: false });
-  }
-
-  /* Re-check both sides: either rider may have cancelled while we waited. */
+/* Joins P2 to P1's trip. The first rider's accept is the only approval
+   needed; the driver is informed, not asked. */
+async function linkPool(p1Id, p1, a) {
   const p2Id = a.p2RideId;
   const p2 = await val('rides/' + p2Id);
+  /* Re-check: P2 may have cancelled, or P1's trip ended, while P1 decided. */
   if (p1.state !== 'ontrip' || !p2 || p2.state !== 'pool_pending' || p2.poolCandidate !== p1Id) {
     await releaseAsk(p1Id, a);
-    return res.status(409).json({ error: 'The second rider is no longer available.' });
+    return { ok: false, error: 'The other rider is no longer available.' };
   }
-
+  const uid = p1.driverUid;
   const now = Date.now();
   await ref().update({
     ['rides/' + p2Id + '/state']: 'assigned',
@@ -374,9 +319,76 @@ router.post('/pool/driver-respond', C.auth, async (req, res) => {
     ['rides/' + p1Id + '/poolOrder']: a.order,
     ['riderRides/' + p1.riderUid + '/' + p1Id + '/fare']: a.split.p1.pays,
 
-    ['driverRides/' + uid + '/' + p2Id]: true
+    ['driverRides/' + uid + '/' + p2Id]: true,
+
+    /* Shown on the driver's screen, ringing, until they tap OK. */
+    ['driverPoolNotice/' + uid]: {
+      p2RideId: p2Id, at: now,
+      pickup: a.p2Pickup, drop: a.p2Drop,
+      pickupLat: p2.points[0].lat, pickupLng: p2.points[0].lng,
+      riderName: p2.riderName || 'Rider',
+      coRiderKm: a.coRiderKm != null ? a.coRiderKm : (p2.fare && p2.fare.km) || 0,
+      coRiderEarn: a.coRiderEarn != null ? a.coRiderEarn : null,
+      pickupDetourKm: a.pickupDetourKm || 0,
+      pickupExtraEarn: a.surcharge != null ? a.surcharge : a.split.p2.surcharge,
+      p1DiscountLoss: a.p1DiscountLoss || 0,
+      totalExtra: a.driverGain != null ? a.driverGain : null,
+      addedKm: a.addedKm, addedMin: a.addedMin
+    }
   });
-  res.json({ ok: true, accepted: true });
+  const prof = await val('drivers/' + uid);
+  push(prof && prof.fcmToken,
+       'Co-rider added \u00b7 +\u20b9' + (a.driverGain != null ? a.driverGain : a.split.p2.surcharge),
+       'Pick up at ' + a.p2Pickup + '. Open RideX and tap OK.');
+  return { ok: true };
+}
+
+/* ── 3. Driver is asked, and sees the pooled plan once linked ── */
+router.get('/pool/driver', C.auth, async (req, res) => {
+  const uid = req.user.uid;
+  const activeId = await val('driverActive/' + uid);
+  let notice = await val('driverPoolNotice/' + uid);
+  if (!activeId) return res.json({ notice: null, plan: null });
+
+  let cur = await val('rides/' + activeId);
+  if (cur && cur.poolAsk) cur = await settle(activeId);
+  if (!cur || cur.driverUid !== uid) return res.json({ notice: null, plan: null });
+
+  // a notice for a co-rider who has since cancelled is no longer relevant
+  if (notice) {
+    const nr = await val('rides/' + notice.p2RideId);
+    if (!nr || !nr.poolWith || String(nr.state).startsWith('cancelled')) {
+      await ref('driverPoolNotice/' + uid).remove();
+      notice = null;
+    }
+  }
+
+  let plan = null;
+  if (cur.poolWith) {
+    const other = await val('rides/' + cur.poolWith);
+    const p1 = cur.poolRole === 'p1' ? cur : other;
+    const p2 = cur.poolRole === 'p2' ? cur : other;
+    const p1Id = cur.poolRole === 'p1' ? activeId : cur.poolWith;
+    const p2Id = cur.poolRole === 'p2' ? activeId : cur.poolWith;
+    const card = (id, r) => r && ({
+      rideId: id, state: r.state, riderName: r.riderName, riderPhone: r.riderPhone,
+      km: r.fare ? r.fare.km : null,
+      pickup: r.addr[0], drop: last(r.addr),
+      pickupLat: r.points[0].lat, pickupLng: r.points[0].lng,
+      dropLat: last(r.points).lat, dropLng: last(r.points).lng,
+      earn: r.poolFare
+        ? driverEarn(r.poolFare.pays + (r.waitCharge || 0) + (r.boost || 0), r.poolFare.surcharge)
+        : null
+    });
+    plan = { order: p1 && p1.poolOrder, p1: card(p1Id, p1), p2: card(p2Id, p2) };
+  }
+  res.json({ notice, plan });
+});
+
+/* Driver has seen the "co-rider added" notice. */
+router.post('/pool/notice-ack', C.auth, async (req, res) => {
+  await ref('driverPoolNotice/' + req.user.uid).remove();
+  res.json({ ok: true });
 });
 
 /* ── 4. Intercepts on existing routes ── */
