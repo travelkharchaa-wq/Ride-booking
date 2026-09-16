@@ -7,7 +7,7 @@
  *   3. Driver is asked:  GET /pool/driver       →  POST /pool/driver-respond
  *   4. Linked. P2 is picked up with the existing /ride/arrived and /ride/start
  *      (P2's own OTP). Drops go through /ride/complete, which this file
- *      intercepts for pooled rides so the order and fare split are enforced.
+ *      intercepts for pooled rides so the fare split is applied (any drop order).
  *
  * This router must be mounted BEFORE rider.js and driver.js, because it
  * intercepts /ride/complete, /ride/cancel and /ride/driver-cancel. For any
@@ -141,21 +141,25 @@ router.post('/pool/find', C.auth, async (req, res) => {
     try {
       const p1Drop = last(c.p1.points);
       const original = await route([c.loc, p1Drop]);
-      const p2At = Pool.projectOnRoute(drop, original.line).at;
-      const order = Pool.dropOrder(1, p2At);
 
-      /* The detour that matters is the one P1 sits through: from here, via
-         P2's pickup (and P2's drop if it comes first), to P1's destination. */
-      const via = order[0] === 'p2' ? [c.loc, pickup, drop, p1Drop] : [c.loc, pickup, p1Drop];
-      const withPool = await route(via);
-
-      const verdict = Pool.evaluateMatch(
-        { shared: c.p1.shared, cls: c.p1.cls, state: c.p1.state, poolWith: c.p1.poolWith,
-          riderGender: c.p1.riderGender, fare: { km: c.p1.fare.km, total: c.p1.fare.total } },
-        { shared: p2.shared, cls: p2.cls, riderGender: p2.riderGender, pickup, drop,
-          fare: { km: p2.fare.km, total: p2.fare.total } },
-        { line: original.line, original, withPool, sharedKm: withPool.legs[1].km }
-      );
+      /* Quick checks on the road shape before spending more routing calls. */
+      const plan = Pool.dropPlan(drop, original.line);
+      const near = Pool.pickupIsNearRoute(pickup, original.line);
+      let verdict;
+      if (!near.ok || plan.kind === 'off') {
+        verdict = { ok: false, reason: !near.ok ? 'pickup off route' : 'drop off route' };
+      } else {
+        const viaPickup = await route([c.loc, pickup, p1Drop]);
+        const viaDrop = plan.kind === 'before'
+          ? await route([c.loc, pickup, drop, p1Drop]) : null;
+        verdict = Pool.evaluateMatch(
+          { shared: c.p1.shared, cls: c.p1.cls, state: c.p1.state, poolWith: c.p1.poolWith,
+            riderGender: c.p1.riderGender, fare: { km: c.p1.fare.km, total: c.p1.fare.total } },
+          { shared: p2.shared, cls: p2.cls, riderGender: p2.riderGender, pickup, drop,
+            fare: { km: p2.fare.km, total: p2.fare.total } },
+          { line: original.line, original, viaPickup, viaDrop }
+        );
+      }
 
       await ref('rides/' + p2Id + '/poolTried/' + c.p1Id).set(true);
       if (!verdict.ok) continue;
@@ -344,7 +348,7 @@ router.post('/pool/driver-respond', C.auth, async (req, res) => {
 
 /* ── 4. Intercepts on existing routes ── */
 
-/* Pooled drop. Enforces drop order, bills the split fare, keeps the
+/* Pooled drop. Bills the split fare, keeps the
    surcharge out of commission, and frees the driver only after both. */
 router.post('/ride/complete', C.auth, async (req, res, next) => {
   const id = req.body.rideId;
@@ -355,13 +359,11 @@ router.post('/ride/complete', C.auth, async (req, res, next) => {
   if (ride.state !== 'ontrip')
     return res.status(409).json({ error: 'Start this trip with the rider\u2019s OTP first.' });
 
+  /* Either rider can be dropped first — whoever's destination the driver
+     reaches. The stored order is only a suggestion shown to the driver. */
   const other = await val('rides/' + ride.poolWith);
   const otherDone = !other || other.state === 'completed' ||
                     String(other.state).startsWith('cancelled');
-  const p1 = ride.poolRole === 'p1' ? ride : other;
-  const order = (p1 && p1.poolOrder) || ['p1', 'p2'];
-  if (order[0] !== ride.poolRole && !otherDone)
-    return res.status(409).json({ error: 'Drop the other rider first.' });
 
   const f = ride.poolFare;
   const collected = f.pays + (ride.waitCharge || 0) + (ride.boost || 0);
