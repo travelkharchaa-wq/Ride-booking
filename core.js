@@ -21,34 +21,59 @@ const CLASSES = {
   bike:   { base:20, incl:1.5, perKm:7,  perMin:1.0, min:25,  fee:3,  gst:0,    factor:0.78 },
   auto:   { base:30, incl:1.5, perKm:12, perMin:1.2, min:35,  fee:5,  gst:0,    factor:1.12 },
   mini:   { base:50, incl:2.0, perKm:15, perMin:1.5, min:60,  fee:9,  gst:0.05, factor:1.00 },
-  prime:  { base:80, incl:2.0, perKm:20, perMin:2.0, min:100, fee:12, gst:0.05, factor:1.00 }
+  prime:  { base:80, incl:2.0, perKm:20, perMin:2.0, min:100, fee:12, gst:0.05, factor:1.00 },
+  parcel: { base:25, incl:1.5, perKm:8,  perMin:1.0, min:30,  fee:5,  gst:0.18, factor:0.78 }
 };
 const WAIT = { freeMin: 3, perMin: 2 };
 const CANCEL = { graceSec: 120, fee: 25 };
 
-function fareFor(cls, km, drivingMin, stops, surge) {
+/* `extras` carries toll and interstate charges, which are pass-through costs
+   the driver actually incurs rather than a service RideX provides. They are
+   added after GST for that reason — you do not charge tax on a reimbursement
+   — and they are excluded from commission when the trip settles, so the
+   driver is made whole rather than paying 18% of a toll they funded. */
+function fareFor(cls, km, drivingMin, stops, surge, extras) {
   const c = CLASSES[cls];
   const mins = drivingMin * c.factor;
   const billKm = Math.max(0, km - c.incl);
   const ride = Math.max(c.base + billKm * c.perKm + mins * c.perMin, c.min) * surge;
   const stopFee = (stops || 0) * (cls === 'bike' ? 8 : 15);
   const gst = Math.round((ride + stopFee + c.fee) * c.gst);
+
+  const toll       = (extras && extras.toll) || 0;
+  const interstate = (extras && extras.interstate) || 0;
+  const passThrough = toll + interstate;
+
   return {
     cls, km: +km.toFixed(2), minutes: Math.round(mins), surge,
     ride: Math.round(ride), stopFee, platformFee: c.fee, gst,
-    total: Math.round(ride + stopFee + c.fee + gst), paymentMode: 'cash'
+    toll, interstate,
+    tollPlazas: (extras && extras.tollPlazas) || [],
+    passThrough,
+    total: Math.round(ride + stopFee + c.fee + gst) + passThrough,
+    paymentMode: 'cash'
   };
 }
 
+/* The route geometry is now requested as well as the distance. Toll plazas
+   can only be detected by testing the actual path against known plaza
+   coordinates, and `overview=false` returned no path at all. `simplified`
+   keeps the response small while retaining enough vertices to test against. */
 async function routeMetrics(points) {
   const coords = points.map(p => p.lng + ',' + p.lat).join(';');
   const res = await fetch('https://router.project-osrm.org/route/v1/driving/' +
-                          coords + '?overview=false');
+                          coords + '?overview=simplified&geometries=geojson');
   if (!res.ok) throw new Error('routing unavailable');
   const j = await res.json();
   const r = j.routes && j.routes[0];
   if (!r) throw new Error('no route');
-  return { km: r.distance / 1000, minutes: r.duration / 60 };
+
+  // GeoJSON gives [lng, lat] pairs; everything else here uses {lat, lng}
+  const line = (r.geometry && Array.isArray(r.geometry.coordinates))
+    ? r.geometry.coordinates.map(c => ({ lat: c[1], lng: c[0] }))
+    : [];
+
+  return { km: r.distance / 1000, minutes: r.duration / 60, line };
 }
 
 const rad = d => d * Math.PI / 180;
@@ -58,10 +83,6 @@ function haversine(a, b) {
             Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng/2)**2;
   return 6371 * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
-/* Precision 4 (~20-40 km cells) so the 3x3 neighbour sweep comfortably
-   covers a 20 km radius search regardless of where the pickup falls inside
-   its own cell. Precision 5 (~5 km cells) was too fine for this — a pickup
-   near a cell edge could miss a driver 15 km away in the wrong direction. */
 const cellsAround = (lat, lng) => {
   const c = geohash.encode(lat, lng, 4);
   return [c, ...geohash.neighbors(c)];
@@ -82,15 +103,10 @@ function verifyLock(token) {
   return q;
 }
 
-/* Every disqualifier is evaluated here, at query time. Nothing depends on a
-   background sweeper having run recently. */
 async function candidates(pickup, cls) {
   const ids = new Set();
   await Promise.all(cellsAround(pickup.lat, pickup.lng).map(async c => {
     const s = await db.ref('geo/' + c).once('value');
-    /* Block body, not an expression body. Firebase cancels enumeration when
-       the callback returns a truthy value, and Set.add returns the Set — so
-       an arrow returning it directly would read only the first child. */
     s.forEach(ch => { ids.add(ch.key); });
   }));
 
@@ -107,15 +123,14 @@ async function candidates(pickup, cls) {
     if (loc.state !== 'idle') return;
     if (now - loc.ts > STALE_MS) return;
     if (prof.onlineSince && (now - prof.onlineSince) / 3600000 > FATIGUE_HOURS) return;
-    if (prof.cls !== cls) return;
+    if (prof.cls !== cls && !(cls === 'parcel' && prof.cls === 'bike')) return;
     const km = haversine(loc, pickup);
-    if (km > 20) return;   // driver search radius
+    if (km > 20) return;
     out.push({ uid, prof, loc, km, score: km - ((prof.rating || 4.5) - 4) * 0.8 });
   }));
   return out.sort((a, b) => a.score - b.score);
 }
 
-/* Dispatch driven by requests instead of timers: whoever polls advances it. */
 async function advance(rideId) {
   const ride = (await db.ref('rides/' + rideId).once('value')).val();
   if (!ride || ride.state !== 'searching') return ride;
@@ -132,8 +147,6 @@ async function advance(rideId) {
   }
 
   if (now - ride.createdAt > 4 * 60 * 1000) {
-    /* Clear riderActive too. Without this the rider stays permanently blocked
-       from booking again — 'no_drivers' is a dead end, not an active ride. */
     await db.ref().update({
       ['rides/' + rideId + '/state']: 'no_drivers',
       ['rides/' + rideId + '/message']:
@@ -154,9 +167,6 @@ async function advance(rideId) {
 
   const offerId = db.ref('offers').push().key;
   const expires = now + OFFER_SEC * 1000;
-  /* A rider can voluntarily add to the fare while searching to improve their
-     chances. It is added on top of the locked fare, never subtracted, and the
-     driver sees the boosted amount in the offer. */
   const payable = ride.fare.total + (ride.boost || 0);
   await db.ref().update({
     ['offers/' + next.uid + '/' + offerId]: {
@@ -170,9 +180,6 @@ async function advance(rideId) {
     ['rides/' + rideId + '/currentOffer']: { uid: next.uid, offerId, expires }
   });
 
-  /* Wake the driver even if their app is closed. Sent as a data-only message
-     so the service worker builds the notification itself — and deliberately
-     not awaited, because a slow push must never hold up dispatch. */
   if (next.prof.fcmToken) {
     admin.messaging().send({
       token: next.prof.fcmToken,
@@ -184,7 +191,6 @@ async function advance(rideId) {
       webpush: { headers: { Urgency: 'high', TTL: String(OFFER_SEC) } }
     }).catch(err => {
       console.warn('push to ' + next.uid + ' failed:', err.code || err.message);
-      // a token goes stale when the driver clears data or reinstalls
       if (err.code === 'messaging/registration-token-not-registered')
         db.ref('drivers/' + next.uid + '/fcmToken').remove().catch(() => {});
     });
@@ -201,14 +207,6 @@ async function auth(req, res, next) {
   } catch { res.status(401).json({ error: 'Please sign in again.' }); }
 }
 
-/* Admin access is granted two ways:
-     1. a custom auth claim (set by the bootstrap endpoint), or
-     2. an entry under adminUids/{uid} in the database.
-
-   The second exists because the first needs an environment variable, a deploy
-   and a secret URL to line up — and when any of that goes wrong you are
-   locked out of your own console with no way back in. A row in the database
-   can be added by hand in the Firebase Console in ten seconds. */
 async function adminOnly(req, res, next) {
   try {
     if (req.user.admin) return next();
@@ -227,4 +225,3 @@ module.exports = {
   fareFor, routeMetrics, haversine, candidates, advance,
   sign, verifyLock, auth, adminOnly
 };
-
