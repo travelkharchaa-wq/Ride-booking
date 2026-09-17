@@ -303,26 +303,39 @@ router.post('/ride/complete', C.auth, async (req, res) => {
   if (!ride || ride.driverUid !== req.user.uid)
     return res.status(403).json({ error: 'Not your ride.' });
 
-  // include any rider-added boost, or the driver would be short-changed
-  const collected = ride.fare.total + (ride.waitCharge || 0) + (ride.boost || 0);
-  const commission = Math.round(collected * COMMISSION);
   const uid = req.user.uid;
+  const waitCharge = ride.waitCharge || 0;
+  const boost = ride.boost || 0;
+  /* Toll and any interstate charge are money the driver handed over at a
+     booth, not revenue — and the rider-added boost is meant for the driver
+     too. Commission is charged only on RideX's own service. Taking 18% of a
+     toll the driver funded would come straight out of their pocket on every
+     Gurgaon trip, and they would notice. */
+  const passThrough = (ride.fare && ride.fare.passThrough) || 0;
+  const collected = ride.fare.total + waitCharge + boost;
+  const commissionable = Math.max(0, collected - passThrough - boost);
+  const commission = Math.round(commissionable * COMMISSION);
 
   await db.ref().update({
     ['rides/' + req.body.rideId + '/state']: 'completed',
     ['rides/' + req.body.rideId + '/endedAt']: Date.now(),
     ['rides/' + req.body.rideId + '/collected']: collected,
     ['rides/' + req.body.rideId + '/commission']: commission,
+    ['rides/' + req.body.rideId + '/passThrough']: passThrough,
     ['drivers/' + uid + '/dues']: admin.database.ServerValue.increment(commission),
     ['drivers/' + uid + '/trips']: admin.database.ServerValue.increment(1),
-    ['ledger/' + uid + '/' + req.body.rideId]: { collected, commission, at: Date.now() },
+    ['ledger/' + uid + '/' + req.body.rideId]:
+      { collected, commission, passThrough, at: Date.now() },
     ['riderRides/' + ride.riderUid + '/' + req.body.rideId + '/state']: 'completed',
     ['riderRides/' + ride.riderUid + '/' + req.body.rideId + '/fare']: collected,
     ['driverLoc/' + uid + '/state']: 'idle',
     ['driverActive/' + uid]: null,
     ['riderActive/' + ride.riderUid]: null
   });
-  res.json({ ok: true, collect: collected, yourShare: collected - commission, commission });
+  res.json({
+    ok: true, collect: collected, yourShare: collected - commission,
+    commission, passThrough
+  });
 });
 
 router.post('/ride/driver-cancel', C.auth, async (req, res) => {
@@ -495,35 +508,6 @@ router.post('/admin/driver/status', C.auth, C.adminOnly, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* Removes a driver's account so the same phone number can apply again from
-   scratch. Their login is untouched (the same number may also be a rider),
-   and trip ledger and settlement records are kept for accounting. */
-router.post('/admin/driver/delete', C.auth, C.adminOnly, async (req, res) => {
-  const uid = String(req.body.uid || '');
-  if (!uid) return res.status(400).json({ error: 'Missing uid.' });
-  const prof = (await db.ref('drivers/' + uid).once('value')).val();
-  if (!prof) return res.status(404).json({ error: 'This driver no longer exists.' });
-  if ((await db.ref('driverActive/' + uid).once('value')).val())
-    return res.status(409).json({ error: 'This driver is on a trip. Cancel or reassign the ride first.' });
-  if ((prof.dues || 0) > 0 && req.body.confirmDues !== true)
-    return res.status(409).json({ error: 'This driver owes \u20b9' + prof.dues + ' in commission.', dues: prof.dues });
-
-  const up = {};
-  up['drivers/' + uid] = null;
-  up['driverDocs/' + uid] = null;
-  up['driverLoc/' + uid] = null;
-  up['offers/' + uid] = null;
-  const loc = (await db.ref('driverLoc/' + uid).once('value')).val();
-  if (loc && loc.gh) up['geo/' + loc.gh + '/' + uid] = null;
-  up['deletedDrivers/' + uid + '/' + Date.now()] = {
-    name: prof.name || '', phone: prof.phone || '', cls: prof.cls || '',
-    plate: prof.plate || '', trips: prof.trips || 0, dues: prof.dues || 0,
-    by: req.user.uid
-  };
-  await db.ref().update(up);
-  res.json({ ok: true });
-});
-
 /* Lets an admin actually look at the licence and RC before approving. */
 router.get('/admin/driver/docs', C.auth, C.adminOnly, async (req, res) => {
   const uid = req.query.uid;
@@ -544,33 +528,22 @@ router.post('/admin/driver/settle', C.auth, C.adminOnly, async (req, res) => {
 });
 
 router.get('/admin/live', C.auth, C.adminOnly, async (req, res) => {
-  const now = Date.now();
-  const [rideSnap, sosSnap] = await Promise.all([
-    db.ref('rides').orderByChild('createdAt').startAt(now - 12 * 3600 * 1000).once('value'),
-    db.ref('sos').limitToLast(50).once('value')
+  const [rides, sos] = await Promise.all([
+    db.ref('rides').orderByChild('createdAt').startAt(Date.now() - 6*3600*1000).once('value'),
+    db.ref('sos').orderByChild('at').startAt(Date.now() - 24*3600*1000).once('value')
   ]);
-
-  const active = [];
-  rideSnap.forEach(c => {
+  const active = [], alerts = [];
+  rides.forEach(c => {
     const r = c.val();
-    if (!r || !['searching', 'pool_pending', 'assigned', 'arrived', 'ontrip'].includes(r.state)) return;
-    active.push({
-      id: c.key, state: r.state,
-      rider: r.riderName || 'Rider',
-      driver: r.driver ? r.driver.name : null,
-      fare: r.poolFare ? r.poolFare.pays : (r.fare ? r.fare.total : 0),
-      from: (r.addr && r.addr[0]) || '',
-      to: (r.addr && r.addr[r.addr.length - 1]) || '',
-      at: r.createdAt || 0
-    });
+    if (r.state !== 'completed' && !String(r.state).startsWith('cancelled'))
+      active.push({ id: c.key, state: r.state, rider: r.riderName,
+        driver: r.driver ? r.driver.name : null,
+        from: r.addr && r.addr[0], to: r.addr && r.addr[r.addr.length - 1],
+        fare: r.fare && r.fare.total });
   });
-  active.sort((a, b) => b.at - a.at);
-
-  const alerts = [];
-  sosSnap.forEach(c => { alerts.push(Object.assign({ id: c.key }, c.val())); });
-  alerts.sort((a, b) => (b.at || 0) - (a.at || 0));
-
-  res.json({ active, alerts, at: now });
+  sos.forEach(c => { alerts.push(Object.assign({ id: c.key }, c.val())); });
+  res.json({ active, alerts });
 });
 
 module.exports = router;
+
