@@ -2,6 +2,7 @@
 const express = require('express');
 const C = require('./core');
 const Pool = require('./pool');
+const T = require('./tolls');
 const router = express.Router();
 const { db, admin, crypto, CLASSES, CANCEL, LOCK_SEC } = C;
 
@@ -65,7 +66,10 @@ router.post('/quote', C.auth, async (req, res) => {
   for (const cls of Object.keys(CLASSES)) {
     const pool = await C.candidates(points[0], cls);
     const surge = pool.length >= 3 ? 1 : pool.length === 2 ? 1.1 : pool.length === 1 ? 1.2 : 1.25;
-    quotes[cls] = C.fareFor(cls, m.km, m.minutes, points.length - 2, surge);
+    /* Toll depends on the class — two- and three-wheelers are exempt on
+       national highways — so it is computed per class, not once per trip. */
+    const extras = T.extrasForTrip(m.line, cls, points[0], points[points.length - 1]);
+    quotes[cls] = C.fareFor(cls, m.km, m.minutes, points.length - 2, surge, extras);
     quotes[cls].eta = pool.length ? Math.max(1, Math.round(pool[0].km / 0.35)) : null;
   }
   res.json({ km: m.km, minutes: m.minutes, surge: 1, quotes, lockSeconds: LOCK_SEC });
@@ -80,7 +84,10 @@ router.post('/quote/lock', C.auth, async (req, res) => {
 
   const pool = await C.candidates(points[0], cls);
   const surge = pool.length >= 3 ? 1 : pool.length === 2 ? 1.1 : pool.length === 1 ? 1.2 : 1.25;
-  const q = C.fareFor(cls, m.km, m.minutes, points.length - 2, surge);
+  /* The toll travels inside the signed fare, so it cannot be stripped out of
+     the quote between seeing the price and booking it. */
+  const extras = T.extrasForTrip(m.line, cls, points[0], points[points.length - 1]);
+  const q = C.fareFor(cls, m.km, m.minutes, points.length - 2, surge, extras);
   q.exp = Date.now() + LOCK_SEC * 1000;
   q.uid = req.user.uid;
   res.json({ fare: q, lock: C.sign(q), expiresAt: q.exp });
@@ -325,3 +332,4 @@ router.post('/ride/boost', C.auth, async (req, res) => {
 });
 
 module.exports = router;
+
